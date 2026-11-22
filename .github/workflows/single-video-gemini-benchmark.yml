@@ -1,0 +1,162 @@
+name: Single-video Android benchmark
+
+on:
+  push:
+    branches: [perf/single-video, perf/long-video, perf/long-video-next, perf/movie-experience]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: video-benchmark-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  android-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check benchmark secret
+        if: github.ref_name == 'perf/single-video'
+        env:
+          GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_BENCHMARK_API_KEY" ]; then
+            echo 'Add GEMINI_BENCHMARK_API_KEY as a repository Actions secret, then rerun.' >&2
+            exit 1
+          fi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Find or install Android command-line tools
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -w "$sdk_root" ]]; then sdk_root="$RUNNER_TEMP/android-sdk"; fi
+          mkdir -p "$sdk_root"
+          export ANDROID_HOME="$sdk_root" ANDROID_SDK_ROOT="$sdk_root"
+          cli="$sdk_root/cmdline-tools/latest/bin"
+          if [[ ! -x "$cli/sdkmanager" ]]; then
+            for installed in "$sdk_root"/cmdline-tools/*/bin; do
+              if [[ -x "$installed/sdkmanager" ]]; then cli="$installed"; break; fi
+            done
+          fi
+          if [[ ! -x "$cli/sdkmanager" ]]; then
+            archive="$RUNNER_TEMP/android-cli.zip"
+            curl -fsSL --retry 3 --max-time 180 \
+              https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -o "$archive"
+            echo "7ec965280a073311c339e571cd5de778b9975026cfcbe79f2b1cdcb1e15317ee  $archive" | sha256sum --check
+            unzip -q "$archive" -d "$RUNNER_TEMP/android-cli"
+            mkdir -p "$sdk_root/cmdline-tools"
+            mv "$RUNNER_TEMP/android-cli/cmdline-tools" "$sdk_root/cmdline-tools/benchmark"
+            cli="$sdk_root/cmdline-tools/benchmark/bin"
+          fi
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\nANDROID_BENCHMARK_CLI=%s\n' "$sdk_root" "$sdk_root" "$cli" >> "$GITHUB_ENV"
+      - name: Install Android SDK and system image
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          "$ANDROID_BENCHMARK_CLI/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses < <(yes)
+          image='system-images;android-34;google_apis;x86_64'
+          "$ANDROID_BENCHMARK_CLI/sdkmanager" --sdk_root="$ANDROID_HOME" --install 'platform-tools' 'emulator' 'platforms;android-35' 'build-tools;35.0.0' "$image"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "$ANDROID_BENCHMARK_CLI/avdmanager" create avd --name gemini-benchmark --package "$image" --path "$ANDROID_AVD_HOME/gemini-benchmark.avd" <<< no
+          test -s "$ANDROID_AVD_HOME/gemini-benchmark.ini"
+          "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx gemini-benchmark
+          printf 'ANDROID_AVD_HOME=%s\n' "$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          sudo chmod a+rw /dev/kvm
+      - name: Verify the shared benchmark clip
+        run: |
+          if [[ "$GITHUB_REF_NAME" == perf/movie-experience ]]; then
+            echo 'c56c2ab9338dd469f07c65685126d06024879283d28a807d7ac774cd0f75bd90  scripts/fixtures/movie-playback-benchmark.mp4' | sha256sum --check
+          elif [[ "$GITHUB_REF_NAME" == perf/long-video* ]]; then
+            echo 'bfbc8fe36aad8e052e15cd875ddf043c99a029e6ef60c57a443e3513834306b4  scripts/fixtures/long-video-ocr-benchmark.mp4' | sha256sum --check
+          else
+            echo '333caae67757141123c37515fea062892d5e9f0815f8bea3e55642699789f727  scripts/fixtures/single-video-ocr-benchmark.mp4' | sha256sum --check
+          fi
+      - name: Build isolated baseline and candidate APKs
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/baseline"
+          baseline_sha=a67e6ea910483d740fa988bcd682d18c4b93d5c7
+          test_class=SingleVideoGeminiBenchmarkTest
+          test_package=batch
+          base_package=com.gemini.ocr.perfbase
+          next_package=com.gemini.ocr.perfnext
+          verification_args=()
+          if [[ "$GITHUB_REF_NAME" == perf/movie-experience ]]; then
+            baseline_sha=052d22dd67dc7889ed74ad0202ab47f1d1bb56bf
+            test_package=movie
+            test_class=MoviePlaybackBenchmarkTest
+            base_package=com.gemini.ocr.playbacktest
+            next_package=com.gemini.ocr.playbacktest
+            verification_args=(-PverificationOffline=true)
+          elif [[ "$GITHUB_REF_NAME" == perf/long-video* ]]; then
+            baseline_sha=46d58e7a93f54ab60a633f422683d26298a79cad
+            if [[ "$GITHUB_REF_NAME" == perf/long-video-next ]]; then
+              baseline_sha=bb22bf5e6ad6845118303c6f6100a4c674332302
+            fi
+            test_class=LongVideoBenchmarkTest
+            base_package=com.gemini.ocr.codexbench
+            next_package=com.gemini.ocr.batchunified186
+            verification_args=(-PverificationOffline=true)
+          fi
+          git worktree add --detach "$baseline" "$baseline_sha"
+          test_path="android-app/app/src/androidTest/java/com/gemini/ocr/$test_package/$test_class.kt"
+          install -D "$test_path" "$baseline/$test_path"
+          python3 scripts/setup_android_asr.py
+          mkdir -p "$baseline/android-app/app/libs"
+          cp android-app/app/libs/sherpa-onnx-static-link-onnxruntime-2.0.1-app.aar "$baseline/android-app/app/libs/"
+          (cd "$baseline/android-app" && bash gradlew --max-workers=2 :app:assembleDebug :app:assembleDebugAndroidTest -PverificationAppId="$base_package" "${verification_args[@]}")
+          (cd android-app && bash gradlew --max-workers=2 :app:assembleDebug :app:assembleDebugAndroidTest -PverificationAppId="$next_package" "${verification_args[@]}")
+      - name: Start one Android emulator
+        run: |
+          set -euo pipefail
+          emulator_log="$RUNNER_TEMP/emulator.log"
+          adb start-server
+          "$ANDROID_HOME/emulator/emulator" -avd gemini-benchmark -accel on -no-window -no-snapshot -no-audio -no-boot-anim -gpu swiftshader_indirect -cores 2 -memory 2048 > "$emulator_log" 2>&1 &
+          emulator_pid=$!
+          deadline=$((SECONDS + 240))
+          until [[ $(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true) == 1 ]]; do
+            if ! kill -0 "$emulator_pid" 2>/dev/null || (( SECONDS >= deadline )); then
+              adb devices -l
+              tail -80 "$emulator_log"
+              exit 1
+            fi
+            sleep 3
+          done
+          adb shell svc power stayon true
+          adb shell input keyevent 82
+      - name: Measure baseline and candidate with native OCR and Gemini
+        if: github.ref_name == 'perf/single-video'
+        env:
+          GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
+        run: |
+          bash scripts/run_single_video_gemini_benchmark.sh "$RUNNER_TEMP/baseline" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/results" "$GITHUB_WORKSPACE/scripts/fixtures/single-video-ocr-benchmark.mp4"
+      - name: Audit native OCR, near-end resume and local save for a 36-minute video
+        if: startsWith(github.ref_name, 'perf/long-video')
+        run: |
+          trials=1
+          if [[ "$GITHUB_REF_NAME" == perf/long-video-next ]]; then trials=3; fi
+          bash scripts/run_long_video_benchmark.sh "$RUNNER_TEMP/baseline" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/results" "$trials"
+      - name: Check Movie Library and playback responsiveness on Android
+        if: github.ref_name == 'perf/movie-experience'
+        run: |
+          bash scripts/run_movie_playback_benchmark.sh "$RUNNER_TEMP/baseline" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/results"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: single-video-android-results
+          path: |
+            ${{ runner.temp }}/results/*.json
+            ${{ runner.temp }}/results/*.png
+            ${{ runner.temp }}/results/*.xml
+          retention-days: 7
