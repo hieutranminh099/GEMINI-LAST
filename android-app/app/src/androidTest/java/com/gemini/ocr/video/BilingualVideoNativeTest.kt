@@ -4,6 +4,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import androidx.media3.common.Player
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -12,6 +13,9 @@ import com.gemini.ocr.settings.AppSettings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import com.gemini.ocr.video.sync.VideoCloudSync
+import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -36,6 +40,20 @@ class BilingualVideoNativeTest {
         val recoveryFile = File(context.filesDir, "sealed.json")
         val sourcePhase = args.getString("bilingualPhase") == "source"
         val simulate = args.getString("bilingualProvider") == "fixture"
+        val evidence = File(context.filesDir, "verification.txt")
+        if (sourcePhase && simulate) {
+            val drive = VideoCloudSync.get(context)
+            val outcome = try {
+                withTimeoutOrNull(30_000L) {
+                    if (drive.authorize() != null) "CONSENT_REQUIRED" else "GRANTED"
+                } ?: "TIMEOUT"
+            } catch (error: Exception) {
+                // Persist only the app's sanitized error code, never an account or a token.
+                Regex("""Google Drive \[request/([A-Za-z0-9_]+)]""")
+                    .find(drive.state.value.message)?.groupValues?.get(1) ?: "UNAVAILABLE"
+            }
+            evidence.appendText("drive_authorization=$outcome\n")
+        }
         if (simulate) {
             VideoTranslationClient.overrideResponseForTest = { batch ->
                 val lines = if (batch.targetLanguage == "en") listOf("My mom is the homeroom teacher.",
@@ -49,6 +67,8 @@ class BilingualVideoNativeTest {
                     .put("content", JSONObject().put("parts", parts)))).toString()
             }
         }
+        val player = AtomicReference<Player?>()
+        val preview = AtomicReference<VideoPreviewFrame?>()
         try {
             if (sourcePhase) {
                 val credential = File(context.filesDir, "credential")
@@ -56,13 +76,26 @@ class BilingualVideoNativeTest {
                     settings.standaloneApiKey = credential.readText()
                     check(credential.delete())
                 }
-                settings.videoTextModel = "gemini-2.5-flash"
+                if (simulate) settings.videoTextModel = "gemini-2.5-flash" else {
+                    // Only the acceptance test selects an accessible model, before any translation.
+                    for (model in AppSettings.VIDEO_MODELS) {
+                        settings.videoTextModel = model
+                        try {
+                            VideoTranslationClient(context).checkModel()
+                            break
+                        } catch (error: VideoApiException) {
+                            if (error.code != "API_MODEL" || model == AppSettings.VIDEO_MODELS.last()) throw error
+                        }
+                    }
+                }
             } else {
                 require(!File(context.filesDir, "credential").exists())
                 settings.restoreGemini(JSONObject(recoveryFile.readText()), password)
-                assertEquals("gemini-2.5-flash", settings.videoTextModel)
+                assertEquals(File(context.filesDir, "expected-model").readText(), settings.videoTextModel)
+                if (!simulate) VideoTranslationClient(context).checkModel()
             }
-            if (!simulate) VideoTranslationClient(context).checkModel()
+            if (sourcePhase) File(context.filesDir, "expected-model").writeText(settings.videoTextModel)
+            evidence.appendText("model=${settings.videoTextModel}\n")
             val jobs = VideoJobs.get(context)
             val video = File(context.filesDir, "dialogue.mp4")
             val subtitle = File(context.filesDir, "zh.srt")
@@ -74,13 +107,19 @@ class BilingualVideoNativeTest {
             suspend fun waitForJob() {
                 withTimeout(150_000L) { while (jobs.busy.value != null) delay(100) }
             }
-            ActivityScenario.launch<VideoActivity>(Intent(context, VideoActivity::class.java).putExtra("project", p.id)).use { activity ->
-                val languages = if (sourcePhase) listOf("vi", "en") else listOf("en")
-                var first = emptyList<VideoCue>()
-                for (language in languages) {
-                    jobs.selectTarget(p.id, language)
+            VideoPreviewDiagnostics.onPlayerForTest = { id, value -> if (id == p.id) player.set(value) }
+            VideoPreviewDiagnostics.onFrameForTest = { value -> if (value.projectId == p.id) preview.set(value) }
+            val intent = Intent(context, VideoActivity::class.java).putExtra("project", p.id)
+            val languages = if (sourcePhase) listOf("vi", "en") else listOf("en")
+            var first = emptyList<VideoCue>()
+            for (language in languages) {
+                jobs.selectTarget(p.id, language)
+                ActivityScenario.launch<VideoActivity>(intent).use { activity ->
                     activity.onActivity { jobs.start(p.id) }
                     waitForJob()
+                }
+                val reviewIntent = Intent(intent).putExtra("ux_step", "review")
+                ActivityScenario.launch<VideoActivity>(reviewIntent).use { activity ->
                     val result = store.load(p.id)
                     assertEquals(result.message, VideoStage.REVIEW, result.stage)
                     assertTrue(result.cloudCalls > 0)
@@ -95,6 +134,17 @@ class BilingualVideoNativeTest {
                         assertTrue(lines[2].contains("rửa"))
                         first = result.cues
                     }
+                    assertTrue("Teacher Liu must retain her name", lines[1].contains(if (language == "en") "liu" else "lưu"))
+                    evidence.appendText("translated=$language\n")
+                    withTimeout(30_000L) { while (player.get() == null) delay(100) }
+                    for (cue in result.cues) {
+                        val timeMs = cue.startMs + 1_500
+                        activity.onActivity { player.get()!!.apply { pause(); seekTo(timeMs) } }
+                        withTimeout(15_000L) {
+                            while (preview.get()?.let { it.positionMs == timeMs && it.cueId == cue.id && it.text == cue.translation } != true) delay(50)
+                        }
+                    }
+                    evidence.appendText("preview=$language\n")
                     for (ass in listOf(false, true)) {
                         val download = VideoDownloads.saveSubtitle(context, result, ass)
                         assertTrue(download.name.contains("-$language-"))
@@ -117,7 +167,7 @@ class BilingualVideoNativeTest {
                             // The test source has a bright bilingual band inside this mask.
                             for (y in listOf(.76f, .92f)) {
                                 val pixel = frame.getPixel((.09f * frame.width).toInt(), (y * frame.height).toInt())
-                                assertTrue(Color.red(pixel) < 35 && Color.green(pixel) < 35 && Color.blue(pixel) < 35)
+                                assertTrue("Source mask at ${time}ms y=$y", Color.red(pixel) < 35 && Color.green(pixel) < 35 && Color.blue(pixel) < 35)
                             }
                             val yellow = (frame.height * 7 / 10 until frame.height).any { y ->
                                 (0 until frame.width step 2).any { x ->
@@ -129,6 +179,7 @@ class BilingualVideoNativeTest {
                             frame.recycle()
                         }
                     }
+                    evidence.appendText("exported=$language\n")
                 }
             }
             if (sourcePhase) {
@@ -138,6 +189,11 @@ class BilingualVideoNativeTest {
                 assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
                 assertFalse(settings.hasGeminiVideoKey())
             }
-        } finally { VideoTranslationClient.overrideResponseForTest = null; password.fill('\u0000') }
+        } finally {
+            VideoTranslationClient.overrideResponseForTest = null
+            VideoPreviewDiagnostics.onPlayerForTest = null
+            VideoPreviewDiagnostics.onFrameForTest = null
+            password.fill('\u0000')
+        }
     }
 }

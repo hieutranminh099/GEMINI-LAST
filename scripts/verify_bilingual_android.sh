@@ -49,13 +49,18 @@ for phase in source recovery; do
     printf '%s' "$GEMINI_BENCHMARK_API_KEY" | transfer credential
   elif [[ $phase == recovery ]]; then
     transfer sealed.json < sealed.json
+    transfer expected-model < expected-model
   fi
   adb shell am instrument -w -e bilingualProvider "$provider" -e bilingualPhase "$phase" -e class com.gemini.ocr.video.BilingualVideoNativeTest \
     "$package.test/androidx.test.runner.AndroidJUnitRunner" > "result-$phase"
+  adb exec-out run-as "$package" cat files/verification.txt 2>/dev/null | grep -E '^(drive_authorization|model|translated|preview|exported)=[A-Za-z0-9._-]+$' || true
   if ! grep -Fq 'OK (1 test)' "result-$phase"; then
-    grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|FAILURES|Tests run' "result-$phase" | head -10
+    grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|TimeoutCancellationException|BilingualVideoNativeTest.kt:[0-9]+|FAILURES|Tests run' "result-$phase" | head -10
     exit 1
   fi
   echo "Android integration passed: provider=$provider phase=$phase"
-  if [[ $phase == source ]]; then adb exec-out run-as "$package" cat files/sealed.json > sealed.json; fi
+  if [[ $phase == source ]]; then
+    adb exec-out run-as "$package" cat files/sealed.json > sealed.json
+    adb exec-out run-as "$package" cat files/expected-model > expected-model
+  fi
 done

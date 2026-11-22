@@ -173,7 +173,7 @@ class VideoJobs internal constructor(
                 retained.cues.any { it.translation.isNotBlank() } && !File(store.folder(old.id), "batch-owner").exists() ->
                 retained.copy(pipeline = retained.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),
                     cues = retained.cues.map { if (it.protectedText || it.translation.isBlank()) it
-                        else it.copy(refinementState = "refresh") },
+                        else it.copy(refinementState = "refresh", localDraft = "", draftVi = "", polishedVi = "", error = "") },
                     stage = VideoStage.PAUSED, resumeStage = if (extractionPending) VideoStage.EXTRACTING else VideoStage.TRANSLATING,
                     message = "Bấm Tiếp tục để dịch theo cấu hình mới. Giữ bản hiện tại đến khi Gemini trả đủ nhóm.")
             translationChanged->retained.copy(pipeline=retained.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),cues=retained.cues.map{if(it.protectedText)it else it.copy(translation="",model="",error="",localDraft="",refinementState="",draftVi="",polishedVi="")},stage=VideoStage.PAUSED,

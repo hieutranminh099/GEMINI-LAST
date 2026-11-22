@@ -34,7 +34,7 @@ class VideoJobsTest {
         jobs = VideoJobs(context)
     }
 
-    @Test fun translationConfigurationInvalidatesDraftsButPreservesApprovedTextAndTimeline() = runBlocking {
+    @Test fun translationConfigurationSchedulesDraftRefreshAndPreservesTextTimingAndPriorExport() = runBlocking {
         val old = store.save(project())
         val saved = jobs.save(old.copy(translationMode = VideoTranslationMode.GEMINI,
             glossary = "军哥=anh Quân", profile = "historical"))
@@ -44,13 +44,15 @@ class VideoJobsTest {
         assertEquals(old.cues.first(), saved.cues.first())
         val draft = saved.cues[1]
         assertEquals("再见", draft.source)
-        assertEquals("", draft.translation)
-        assertEquals("", draft.model)
+        assertEquals(old.cues[1].translation, draft.translation)
+        assertEquals(old.cues[1].model, draft.model)
+        assertEquals("refresh", draft.refinementState)
+        assertFalse(VideoTranslationPlan.isComplete(draft, false))
         assertEquals("", draft.error)
         assertFalse(draft.approved)
         assertEquals(VideoStage.PAUSED, saved.stage)
         assertEquals(VideoStage.TRANSLATING, saved.resumeStage)
-        assertEquals("", saved.exportedMp4)
+        assertEquals(old.exportedMp4, saved.exportedMp4)
         assertEquals(old.scanMs, saved.scanMs)
         assertEquals(old.carry.toString(), saved.carry.toString())
         assertEquals(saved.cues, store.load(old.id).cues)
@@ -192,13 +194,16 @@ class VideoJobsTest {
         assertFalse(saved.style.background)
     }
 
-    @Test fun switchingToHybridClearsUnreviewedTranslationAndLocalDraftButPreservesApprovedPair()=runBlocking{
+    @Test fun switchingToHybridRefreshesUnreviewedTranslationAndClearsOldLocalDraft()=runBlocking{
         val old=store.save(project().copy(cues=project().cues.map{it.copy(localDraft="Nháp cũ",refinementState="done")}))
         val saved=jobs.save(old.copy(translationMode=VideoTranslationMode.HYBRID))
         assertEquals(old.cues.first(),saved.cues.first())
         val draft=saved.cues[1]
-        assertEquals("",draft.translation);assertEquals("",draft.localDraft)
-        assertEquals("",draft.refinementState);assertEquals("",draft.model)
+        assertEquals(old.cues[1].translation, draft.translation)
+        assertEquals("", draft.localDraft)
+        assertEquals("refresh", draft.refinementState)
+        assertEquals(old.cues[1].model, draft.model)
+        assertFalse(VideoTranslationPlan.isComplete(draft, true))
         assertFalse(draft.approved)
         assertEquals(old.cues[1].source,draft.source)
         assertEquals(old.cues[1].startMs,draft.startMs);assertEquals(old.cues[1].endMs,draft.endMs)

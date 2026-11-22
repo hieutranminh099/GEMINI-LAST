@@ -23,18 +23,39 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq espeak-ng ffmpeg fonts-noto-cjk
           python scripts/setup_android_asr.py
+      - name: Start isolated Android
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          sudo chmod a+rw /dev/kvm
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/bilingual-avds"
+          mkdir -p "$ANDROID_AVD_HOME"
+          image='system-images;android-34;google_apis;x86_64'
+          sdkmanager --sdk_root="$ANDROID_HOME" --install 'emulator' "$image"
+          avdmanager create avd --name bilingual --package "$image" --device pixel_2 --path "$ANDROID_AVD_HOME/bilingual.avd" <<< no
+          "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx bilingual
+          df -h "$ANDROID_AVD_HOME"
+          adb start-server
+          "$ANDROID_HOME/emulator/emulator" -avd bilingual -accel on -no-window -no-snapshot -no-audio -no-boot-anim \
+            -gpu swiftshader -cores 2 -memory 2048 -partition-size 2560 > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          emulator_pid=$!
+          deadline=$((SECONDS + 300))
+          until [[ $(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true) == 1 ]]; do
+            if ! kill -0 "$emulator_pid" 2>/dev/null || (( SECONDS >= deadline )); then
+              adb devices -l
+              tail -70 "$RUNNER_TEMP/emulator.log"
+              exit 1
+            fi
+            sleep 3
+          done
+          adb shell svc power stayon true
+          adb shell input keyevent 82
       - name: Build both disposable APKs
         working-directory: android-app
         run: bash gradlew -PverificationAppId=com.gemini.ocr.bilingualtest :app:assembleDebug :app:assembleDebugAndroidTest --max-workers=2
-      - name: Start isolated Android
+      - name: Install verification app and instrumentation
         run: |
-          sudo chmod a+rw /dev/kvm
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-          sdkmanager 'emulator' 'system-images;android-34;google_apis;x86_64'
-          echo no | avdmanager create avd -n bilingual -k 'system-images;android-34;google_apis;x86_64'
-          nohup "$ANDROID_HOME/emulator/emulator" -avd bilingual -no-window -no-snapshot -no-audio -gpu swiftshader_indirect > "$RUNNER_TEMP/emulator.log" 2>&1 &
-          timeout 240 bash -c 'until [[ $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") == 1 ]]; do sleep 2; done'
-          adb shell input keyevent 82
           adb install android-app/app/build/outputs/apk/debug/app-debug.apk
           adb install android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Check native media export and Android Keystore recovery with controlled translations
