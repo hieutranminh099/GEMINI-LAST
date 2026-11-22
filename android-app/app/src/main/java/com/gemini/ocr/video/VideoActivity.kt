@@ -1419,12 +1419,15 @@ private fun CueEditor(cue: VideoCue, allCues: List<VideoCue>, durationMs: Long, 
                 OutlinedTextField(start, { start = it; markDraft() }, label = { Text("Bắt đầu · hh:mm:ss.mmm hoặc giây") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text))
                 OutlinedTextField(end, { end = it; markDraft() }, label = { Text("Kết thúc") })
+                val unchanged = source == cue.source && translation == cue.translation &&
+                    start == videoTime(cue.startMs) && end == videoTime(cue.endMs)
                 val next = allCues.getOrNull(allCues.indexOfFirst { it.id == cue.id } + 1)
-                if (next != null) TextButton(onClick = onJoin,
-                    enabled = source == cue.source && translation == cue.translation && start == videoTime(cue.startMs) && end == videoTime(cue.endMs)) {
+                if (next != null) TextButton(onClick = onJoin, enabled = unchanged) {
                     Text("Nối với câu sau · " + next.source)
                 }
-                TextButton(onClick = onRetry) { Text("Dịch lại câu này bằng chế độ đã chọn") }
+                TextButton(onClick = onRetry, enabled = unchanged && approved == cue.approved && !cue.protectedText) {
+                    Text("Dịch lại câu này bằng chế độ đã chọn")
+                }
             }
             if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
     }

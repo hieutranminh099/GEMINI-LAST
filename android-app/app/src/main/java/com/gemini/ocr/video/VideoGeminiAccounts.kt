@@ -23,14 +23,15 @@ internal object VideoGeminiAccounts {
         primaryKey: String,
         beforeDispatch: suspend () -> Unit,
         onRetry: suspend (Int, Long, String) -> Unit = { _, _, _ -> },
+        retryPolicy: VideoApiRetryPolicy = VideoApiRetryPolicy.STANDARD,
         operation: suspend (String) -> T
     ): T {
         val settings = AppSettings(context)
         val mode = settings.geminiKeyMode
         if (mode == GeminiKeyMode.PRIMARY_ONLY) {
-            return VideoApiRecovery.run(beforeDispatch, onRetry = onRetry) { operation(primaryKey) }
+            return VideoApiRecovery.run(beforeDispatch, onRetry = onRetry, retryPolicy = retryPolicy) { operation(primaryKey) }
         }
-        return pool(context).request(settings.geminiVideoKeys(), mode, beforeDispatch, onRetry, operation)
+        return pool(context).request(settings.geminiVideoKeys(), mode, beforeDispatch, onRetry, retryPolicy, operation)
     }
 
     private fun pool(context: Context): GeminiAccountPool = synchronized(pools) {
@@ -89,6 +90,7 @@ internal class GeminiAccountPool(
         mode: GeminiKeyMode,
         beforeDispatch: suspend () -> Unit,
         onRetry: suspend (Int, Long, String) -> Unit = { _, _, _ -> },
+        retryPolicy: VideoApiRetryPolicy = VideoApiRetryPolicy.STANDARD,
         operation: suspend (String) -> T
     ): T {
         val credentials = configured.take(3).map { it.copy(key = it.key.trim()) }.filter { it.key.isNotBlank() }
@@ -102,8 +104,10 @@ internal class GeminiAccountPool(
                 is Admission.Unavailable -> {
                     val waiting = admission.cooldown
                     onRetry(maxOf(1, attempts), waiting.untilMs, waiting.code)
-                    if (attempts in 1..2 && isTransportFailure(waiting.code)) {
-                        sleep((waiting.untilMs - clockMs()).coerceAtLeast(1))
+                    val remaining = (waiting.untilMs - clockMs()).coerceAtLeast(1)
+                    if (attempts in 1 until retryPolicy.maxAttempts && isTransportFailure(waiting.code) &&
+                        remaining <= retryPolicy.maxWaitMs) {
+                        sleep(remaining)
                     } else throw unavailable(waiting)
                 }
                 is Admission.Lease -> {
@@ -128,7 +132,7 @@ internal class GeminiAccountPool(
                         val wait = cooldown(failure, attempts)
                         if (wait == null) throw failure
                         record(admission, wait)
-                        if (attempts >= 3) {
+                        if (attempts >= retryPolicy.maxAttempts) {
                             val earliest = synchronized(lock) { nextCooldown(credentials) }
                             onRetry(attempts, earliest.untilMs, earliest.code)
                             throw unavailable(earliest)

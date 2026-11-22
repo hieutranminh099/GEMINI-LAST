@@ -216,6 +216,7 @@ class VideoJobs internal constructor(
         check(busy.value==null){"Tạm dừng tác vụ hiện tại."};val p=store.load(id)
         val index = p.cues.indexOfFirst { it.id == cueId }
         require(index >= 0)
+        require(!p.cues[index].protectedText) { "Câu đã duyệt hoặc chỉnh tay được giữ nguyên." }
         if (p.translationMode != VideoTranslationMode.OFFLINE) {
             val settings = AppSettings(context)
             val batch = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(p.cues, index), p.dialogueContext).copy(targetLanguage = p.targetLanguage,

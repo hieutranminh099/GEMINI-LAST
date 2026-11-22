@@ -57,7 +57,7 @@ internal class VideoPolishClient(
             exchangeWhileActive { VideoApiRecovery.exchange(httpClient, request) }
         }
         val body = if (context == null) VideoApiRecovery.run(beforeCall, onRetry = onRetry) { operation(apiKey) }
-            else VideoGeminiAccounts.request(context, apiKey, beforeCall, onRetry, operation)
+            else VideoGeminiAccounts.request(context, apiKey, beforeCall, onRetry, operation = operation)
         validated(body, batch, glossary, allowPartial, (System.nanoTime() - started) / 1_000_000L)
     }
 

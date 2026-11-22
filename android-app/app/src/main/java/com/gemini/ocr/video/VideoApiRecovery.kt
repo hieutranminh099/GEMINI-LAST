@@ -1,6 +1,9 @@
 package com.gemini.ocr.video
 
 import com.gemini.ocr.network.StandaloneTranslator
+import com.gemini.ocr.network.HttpCallMetrics
+import com.gemini.ocr.network.HttpTransportMetrics
+import com.gemini.ocr.network.HttpTransportTiming
 import com.gemini.ocr.network.awaitBody
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -33,6 +36,17 @@ internal class VideoApiException(
     detail: String = "Tiến độ đã được lưu.",
     val responseReason: VideoResponseFailureReason? = null
 ) : IOException("[$code] $detail")
+
+internal enum class VideoApiRetryPolicy(val maxAttempts: Int, val maxWaitMs: Long) {
+    STANDARD(3, Long.MAX_VALUE), FOCUSED(2, 15_000L);
+
+    fun deferred(failure: VideoApiException, retryAt: Long): VideoApiException = VideoApiException(
+        failure.code, transient = true, retryAfterMs = failure.retryAfterMs,
+        splitAllowed = failure.splitAllowed, nextRetryAt = retryAt,
+        detail = "Dịch vụ đang yêu cầu chờ. Thời điểm có thể thử lại: " +
+            java.time.Instant.ofEpochMilli(retryAt).atZone(java.time.ZoneId.systemDefault())
+                .format(DateTimeFormatter.ofPattern("dd/MM HH:mm:ss")) + ". Tiến độ đã lưu.")
+}
 
 /** Default requests are serial. An explicit batch scope can admit independent video requests. */
 internal object VideoApiRecovery {
@@ -109,6 +123,7 @@ internal object VideoApiRecovery {
             sleep: suspend (Long) -> Unit,
             jitter: () -> Long,
             dispatchTurn: suspend () -> Unit,
+            retryPolicy: VideoApiRetryPolicy,
             operation: suspend () -> T
         ): T {
             var attempt = 0
@@ -136,7 +151,7 @@ internal object VideoApiRecovery {
                             // Publish failures while owning the slot, before queued requests enter.
                             synchronized(state) {
                                 if (failure.code in setOf("API_AUTH", "API_QUOTA_EXHAUSTED") ||
-                                    (failure.transient && attempt >= 2)) {
+                                    (failure.transient && attempt + 1 >= retryPolicy.maxAttempts)) {
                                     terminal = if (failure.transient) VideoApiException(failure.code, true,
                                         failure.retryAfterMs, failure.splitAllowed,
                                         maxOf(retryAt, failure.nextRetryAt, clockMs() + failure.retryAfterMs),
@@ -150,6 +165,9 @@ internal object VideoApiRecovery {
                                     retryAt = maxOf(retryAt, failure.nextRetryAt, clockMs() + wait)
                                     retryCode = failure.code
                                     failureDeadline = retryAt
+                                    if (retryAt - clockMs() > retryPolicy.maxWaitMs) {
+                                        throw ParallelAbort(retryPolicy.deferred(failure, retryAt))
+                                    }
                                 }
                             }
                             throw failure
@@ -174,10 +192,11 @@ internal object VideoApiRecovery {
         sleep: suspend (Long) -> Unit = { delay(it) },
         jitter: () -> Long = { Random.nextLong(251) },
         dispatchTurn: suspend () -> Unit = { StandaloneTranslator.awaitVideoDispatchTurn() },
+        retryPolicy: VideoApiRetryPolicy = VideoApiRetryPolicy.STANDARD,
         operation: suspend () -> T
     ): T {
         currentCoroutineContext()[ParallelRequests]?.let {
-            return it.run(beforeDispatch, onRetry, sleep, jitter, dispatchTurn, operation)
+            return it.run(beforeDispatch, onRetry, sleep, jitter, dispatchTurn, retryPolicy, operation)
         }
         var attempt = 0
         while (true) {
@@ -198,27 +217,34 @@ internal object VideoApiRecovery {
                     else -> throw error
                 }
                 if (!failure.transient) throw failure
-                if (attempt >= 2) {
-                    if (failure.retryAfterMs > 0) throw VideoApiException(failure.code, true,
-                        failure.retryAfterMs, failure.splitAllowed,
-                        nextRetryAt = System.currentTimeMillis() + failure.retryAfterMs,
-                        detail = "Dịch vụ vẫn đang yêu cầu chờ; tiến độ và thời điểm tiếp tục đã lưu.")
+                val now = System.currentTimeMillis()
+                if (attempt + 1 >= retryPolicy.maxAttempts) {
+                    val retryAt = maxOf(failure.nextRetryAt, now + failure.retryAfterMs)
+                    if (retryAt > now) throw retryPolicy.deferred(failure, retryAt)
                     throw failure
                 }
                 val wait = maxOf(failure.retryAfterMs, (1_000L shl attempt) + jitter().coerceIn(0, 250))
+                val retryAt = maxOf(failure.nextRetryAt, now + wait)
                 attempt++
-                onRetry(attempt, System.currentTimeMillis() + wait, failure.code)
-                sleep(wait)
+                onRetry(attempt, retryAt, failure.code)
+                if (retryAt - now > retryPolicy.maxWaitMs) throw retryPolicy.deferred(failure, retryAt)
+                sleep(retryAt - now)
             }
         }
     }
 
-    suspend fun exchange(client: OkHttpClient, request: Request): String {
+    suspend fun exchange(client: OkHttpClient, request: Request,
+                         onTiming: ((HttpCallMetrics, HttpTransportMetrics) -> Unit)? = null): String {
         var retryAfter: String? = null
         val observed = client.newBuilder().addNetworkInterceptor { chain ->
             chain.proceed(chain.request()).also { retryAfter = it.header("Retry-After") }
         }.build()
-        val response = try { observed.newCall(request).awaitBody() }
+        val timing = onTiming?.let { HttpTransportTiming() }
+        val timedRequest = if (timing == null) request else request.newBuilder()
+            .tag(HttpTransportTiming::class.java, timing).build()
+        val response = try { observed.newCall(timedRequest).awaitBody(observer = timing?.let { tracker ->
+            { metrics -> onTiming?.invoke(metrics, tracker.snapshot()) }
+        }) }
         catch (cancel: CancellationException) { throw cancel }
         catch (error: IOException) { throw networkFailure(error) }
         if (!response.isSuccessful) throw httpFailure(response.code, response.body, retryAfter)

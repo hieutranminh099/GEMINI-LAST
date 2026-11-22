@@ -1,5 +1,6 @@
 package com.gemini.ocr.movie
 
+import com.gemini.ocr.settings.AppSettings
 import com.gemini.ocr.video.VideoCue
 import com.gemini.ocr.video.VideoProject
 import com.gemini.ocr.video.VideoStage
@@ -41,11 +42,17 @@ class MovieCaptionEditingTest {
     }
 
     @Test fun geminiSuggestionTargetsOnlyChosenCueAndLegacyWithoutTimelineCannotBeEdited() {
-        val batch = movieCaptionRequest(project, second.id)
+        val draft = project.copy(cues = listOf(first.copy(translation = ""), second), dialogueContext = "00:00.370 | The host says goodbye.",
+            targetLanguage = "en")
+        val batch = movieCaptionRequest(draft, second.id, AppSettings.VIDEO_FLASH_MODEL)
         assertEquals(listOf(second.id), batch.cueIds)
         assertEquals(listOf(second.source), batch.texts)
         assertTrue(batch.videoContext.contains(first.source))
-        assertEquals("Hẹn gặp lại", project.cues.last().translation)
+        assertTrue(batch.videoContext.contains("The host says goodbye."))
+        assertTrue(batch.strictDialogue)
+        assertEquals("en", batch.targetLanguage)
+        assertEquals(AppSettings.VIDEO_FLASH_MODEL, batch.requestModel)
+        assertEquals(second, draft.cues.last())
         val legacy = MovieEpisode("legacy", "Tập cũ", "/burned.mp4", 1000)
         assertTrue(runCatching { reviseMovieCaption(legacy, "", first.id, "Sửa", 200) }.isFailure)
     }

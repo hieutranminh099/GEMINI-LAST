@@ -121,7 +121,8 @@ internal object VideoFullDialoguePlan {
             val cue=cues[index]
             val objectRow=JSONObject().put("id",cue.id).put("index",index)
                 .put("startMs",cue.startMs).put("endMs",cue.endMs).put("source",cue.source)
-                .put("approved",cue.protectedText)
+                .put("approved",cue.approved)
+            if(VideoDialoguePrompt.uncertainSource(cue))objectRow.put("uncertainSource",true)
             if(cue.protectedText || VideoTranslationPlan.isComplete(cue,true)){
                 if(cue.translation.isNotBlank())objectRow.put("vietnamese",cue.translation)
             }else cue.localDraft.ifBlank{cue.translation}.takeIf{it.isNotBlank()}?.let{objectRow.put("localDraft",it)}
