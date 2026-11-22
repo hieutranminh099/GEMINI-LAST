@@ -140,7 +140,7 @@ internal class DriveVideoRepository(
             }
             onProgress("Đang tải ${episode.title.take(60)} lên Google Drive…")
             val existing=findMedia(local.sha,local.size)
-            val fileId=if(existing!=null){verifyMovieUpload(existing,local);existing}
+            val fileId=if(existing!=null){verifyDriveUpload(existing,local);existing}
                 else upload(local,movie.id,"movie",verifyServer=true)
             media.put(JSONObject().put("role","episode").put("episodeId",episode.id).put("id",fileId)
                 .put("size",local.size).put("sha256",local.sha).put("mime",local.mime))
@@ -148,7 +148,7 @@ internal class DriveVideoRepository(
         if(movie.coverPath.isNotBlank() && File(movie.coverPath).isFile) {
             val local=inspectMovieMedia(File(movie.coverPath),"image/jpeg")
             val existing=findMedia(local.sha,local.size)
-            val fileId=if(existing!=null){verifyMovieUpload(existing,local);existing}
+            val fileId=if(existing!=null){verifyDriveUpload(existing,local);existing}
                 else upload(local,movie.id,"movie",verifyServer=true)
             media.put(JSONObject().put("role","cover").put("id",fileId).put("size",local.size).put("sha256",local.sha).put("mime",local.mime))
         }
@@ -164,7 +164,7 @@ internal class DriveVideoRepository(
         // A retry after a successful publication reuses the same catalog revision.
         val previous=listFiles("appProperties has { key='kind' and value='$manifestKind' } and appProperties has { key='projectId' and value='${movie.id}' } and appProperties has { key='revision' and value='$revision' }").firstOrNull()
         if(previous!=null) {
-            val fileId=previous.getString("id");verifyMovieUpload(fileId,local);return@withContext fileId
+            val fileId=previous.getString("id");verifyDriveUpload(fileId,local);return@withContext fileId
         }
         upload(local,movie.id,revision,movie.title,movie.updatedAt,media.sumSizes(),finalKind=manifestKind,verifyServer=true)
     }
