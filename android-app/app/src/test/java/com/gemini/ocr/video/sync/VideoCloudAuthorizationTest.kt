@@ -63,6 +63,29 @@ class VideoCloudAuthorizationTest {
         assertTrue(sync.state.value.authorizationRequired)
         assertEquals(0,server.requestCount)
     }
+    @Test fun cancellingAccountSwitchPreservesPreviousGrantAndUploadPreference()=runBlocking {
+        val prefs = context.getSharedPreferences("video-google-sync", Context.MODE_PRIVATE)
+        prefs.edit().putString("account", "previous@example.com").putBoolean("enabled", true).commit()
+        val sync = sync { throw ApiException(Status(16, "provider-cancelled")) }
+        val playing = sync.playbackAccountGuard("previous@example.com")
+        val error = failure { sync.completeAuthorization(Intent(), Activity.RESULT_CANCELED) }
+        assertTrue(error.message.orEmpty().contains("callback/16"))
+        assertEquals("previous@example.com", sync.state.value.accountEmail)
+        assertFalse(sync.state.value.authorizationRequired)
+        assertTrue(sync.state.value.enabled)
+        playing()
+        assertEquals(0, server.requestCount)
+    }
+    @Test fun cancelledActivityCannotCommitAParsedTokenOrClearAnExpiredGrant()=runBlocking {
+        val prefs = context.getSharedPreferences("video-google-sync", Context.MODE_PRIVATE)
+        prefs.edit().putString("account", "previous@example.com").putBoolean("needsAuth", true).commit()
+        val sync = sync()
+        val error = failure { sync.completeAuthorization(Intent(), Activity.RESULT_CANCELED) }
+        assertTrue(error.message.orEmpty().contains("callback/CANCELED"))
+        assertEquals("previous@example.com", sync.state.value.accountEmail)
+        assertTrue(sync.state.value.authorizationRequired)
+        assertEquals(0, server.requestCount)
+    }
     @Test fun verifiedGoogleResultCommitsAccountAndDoesNotEnableUploads()=runBlocking {
         server.enqueue(MockResponse().setBody("""{"email":"verified@example.com"}"""))
         val sync=sync()
