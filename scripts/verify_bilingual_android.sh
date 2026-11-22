@@ -53,7 +53,7 @@ for phase in source recovery; do
   fi
   adb shell am instrument -w -e bilingualProvider "$provider" -e bilingualPhase "$phase" -e class com.gemini.ocr.video.BilingualVideoNativeTest \
     "$package.test/androidx.test.runner.AndroidJUnitRunner" > "result-$phase"
-  adb exec-out run-as "$package" cat files/verification.txt 2>/dev/null | grep -E '^(drive_authorization|model|translated|preview|subtitles|rendered|exported|excerpt_[a-z_]+)=[A-Za-z0-9._-]+$' || true
+  adb exec-out run-as "$package" cat files/verification.txt 2>/dev/null | grep -E '^(drive_authorization|model|translated|preview|subtitles|rendered|exported|service_retry|excerpt_[a-z_]+)=[A-Za-z0-9._-]+$' || true
   if ! grep -Fq 'OK (1 test)' "result-$phase"; then
     grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|TimeoutCancellationException|BilingualVideoNativeTest.kt:[0-9]+|FAILURES|Tests run|INSTRUMENTATION_(FAILED|CODE|RESULT): (shortMsg=Process (crashed|died)|-?[0-9]+)' "result-$phase" | head -12 || true
     # Only fixed diagnostic patterns, never dump this app's logs or credentials.

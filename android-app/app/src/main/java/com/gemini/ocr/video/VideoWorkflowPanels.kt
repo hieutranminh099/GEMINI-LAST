@@ -181,7 +181,8 @@ internal fun VideoSetupPanel(project: VideoProject, enabled: Boolean, keyReady: 
                 }
                 var scene by rememberSaveable(project.id, project.dialogueContext) { mutableStateOf(project.dialogueContext) }
                 OutlinedTextField(scene, { if (it.length <= 4000) scene = it }, enabled = enabled,
-                    label = { Text("Bối cảnh, nhân vật và quan hệ đã xác nhận") }, minLines = 2)
+                    label = { Text("Bối cảnh, nhân vật và quan hệ đã xác nhận") }, minLines = 2,
+                    supportingText = { Text("Ghi chú riêng một cảnh theo mẫu 01:15 | Ai đang nói với ai, hoặc đồ vật đang xuất hiện.") })
                 if (scene != project.dialogueContext) TextButton(onClick = { onSave(project.copy(dialogueContext = scene)) }, enabled = enabled) {
                     Text("Lưu bối cảnh cho cả hai ngôn ngữ")
                 }

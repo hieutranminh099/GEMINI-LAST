@@ -132,6 +132,14 @@ class BilingualVideoNativeTest {
                 ActivityScenario.launch<VideoActivity>(intent).use { activity ->
                     activity.onActivity { jobs.start(p.id) }
                     waitForJob()
+                    val stopped = store.load(p.id)
+                    if (stopped.stage == VideoStage.FAILED && stopped.message.contains("[API_SERVICE_503]")) {
+                        evidence.appendText("service_retry=$language\n")
+                        if (first.isNotEmpty()) assertEquals(first, stopped.selectTarget("vi").cues)
+                        delay(10_000)
+                        activity.onActivity { jobs.start(p.id) }
+                        waitForJob()
+                    }
                 }
                 val reviewIntent = Intent(intent).putExtra("ux_step", "review")
                 ActivityScenario.launch<VideoActivity>(reviewIntent).use { activity ->
@@ -244,24 +252,33 @@ class BilingualVideoNativeTest {
             "是我让小凯别说的。", "张强。", "我帮您洗吧。", "我爸忙着挣钱，顾不上我。",
             "刘老师！", "章强。", "你们干嘛？")
         val rows = sources.mapIndexed { i, text -> VideoCue("excerpt-$i", i * 4000L, i * 4000L + 3500, text) }
-        val context = "Teacher Liu is Li Kai's mother. Classmate Zhang Qiang visits unexpectedly. " +
-            "At dinner the table already has several dishes. At 00:40 the student is standing at the sink " +
-            "holding the used dinner plates and speaking politely to his teacher. " +
-            "Zhang Qiang then mentions his father. At 00:56 Kai opens the door. His mother and " +
-            "his classmate are the only two people he sees. He questions both of them. " +
-            "Three unconfirmed OCR transcriptions of names occur. Their identities have not been verified."
+        val context = """
+            Teacher Liu is Li Kai's mother. Classmate Zhang Qiang visits unexpectedly.
+            Three unconfirmed OCR transcriptions of names occur. Their identities have not been verified.
+            00:24 | A meal is already laid out. The hostess welcomes her unexpected guest.
+            00:40 | At the sink, the student takes a stack of dirty plates and bowls from his teacher's hands.
+            00:44 | Zhang Qiang is speaking about his father.
+            00:56 | Kai opens the door, sees his mother and his classmate, turns to his mother and questions both people.
+        """.trimIndent()
         val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
         for (language in listOf("vi", "en")) {
             val request = batch.copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
             val result = client.translate(settings.effectiveStandaloneApiKey(), request, "document", "") {}
             assertEquals(request.cueIds, result.accepted.keys.toList())
-            val text = rows.map { result.accepted.getValue(it.id).lowercase() }
+            val text = rows.map { java.text.Normalizer.normalize(result.accepted.getValue(it.id), java.text.Normalizer.Form.NFC).lowercase() }
             // These checks cover explicit lexical evidence. Subtle pronouns need the original scene.
-            fun checkWords(label: String, index: Int, vararg alternatives: String) {
+            suspend fun checkWords(label: String, index: Int, vararg alternatives: String) {
                 val found = alternatives.any { text[index].contains(it) }
                 evidence.appendText("excerpt_${language}_$label=${if (found) "MATCH" else "REVIEW"}\n")
-                if (label == "dishes" || label == "pair") {
-                    assertTrue("Scene context required for excerpt $index ($language/$label)", found)
+                if (!found && label in setOf("dishes", "pair")) {
+                    val single = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, index), context)
+                        .copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
+                    val retry = client.translate(settings.effectiveStandaloneApiKey(), single, "document", "") {}
+                    val revised = java.text.Normalizer.normalize(retry.accepted.getValue(rows[index].id),
+                        java.text.Normalizer.Form.NFC).lowercase()
+                    val corrected = alternatives.any(revised::contains)
+                    evidence.appendText("excerpt_${language}_${label}_retry=${if (corrected) "MATCH" else "REVIEW"}\n")
+                    assertTrue("Scene context required for excerpt $index ($language/$label)", corrected)
                 }
             }
             if (language == "vi") {

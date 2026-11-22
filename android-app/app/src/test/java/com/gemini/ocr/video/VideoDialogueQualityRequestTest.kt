@@ -116,9 +116,9 @@ class VideoDialogueQualityRequestTest {
 
     @Test fun promptRevisionInvalidatesOldPrivateCacheEntriesAndIsPresentInTheActualRequest(){
         val batch=plan();val current=JSONObject(batch.videoContext)
-        assertEquals("video-dialogue-quality-v3",VideoDialoguePrompt.REVISION)
+        assertEquals("video-dialogue-quality-v4",VideoDialoguePrompt.REVISION)
         assertEquals(VideoDialoguePrompt.REVISION,current.getString("promptRevision"))
-        val old=JSONObject(batch.videoContext).put("promptRevision", "video-dialogue-quality-v2")
+        val old=JSONObject(batch.videoContext).put("promptRevision", "video-dialogue-quality-v3")
         val scope="controlled-private-batch-scope"
         assertNotEquals(BatchTranslationCache.key(scope,old.toString()),BatchTranslationCache.key(scope,batch.videoContext))
         assertEquals(VideoDialoguePrompt.REVISION,data(request(batch)).getString("promptRevision"))

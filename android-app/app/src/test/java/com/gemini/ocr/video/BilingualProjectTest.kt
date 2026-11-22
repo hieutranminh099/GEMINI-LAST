@@ -31,6 +31,14 @@ class BilingualProjectTest {
         assertTrue(VideoDownloads.resultName("Film.mp4","srt","en").contains("-en-"))
     }
 
+    @Test fun timedSceneNotesUseTheSharedSourceClockAndDoNotLeakAcrossGaps() {
+        val rows = org.json.JSONArray(old.cues.map { it.json() })
+        val supplied = "The teacher is the host.\n00:00.829 | first\n00:00,830 | second\n00:01.800 | gap\n00:00:02 | third"
+        assertTrue(VideoDialoguePrompt.attachSceneNotes(rows, supplied))
+        assertEquals(listOf("first", "second", "third"), (0 until rows.length()).map { rows.getJSONObject(it).getString("sceneNote") })
+        assertFalse(rows.toString().contains("gap"))
+    }
+
     @Test fun englishPromptUsesChineseAndNeighboringSpeechWithoutVietnameseOutputInstructions() {
         val batch=VideoTranslationPlan.forCue(old.selectTarget("en").cues,2)
             .copy(targetLanguage="en",strictDialogue=true)

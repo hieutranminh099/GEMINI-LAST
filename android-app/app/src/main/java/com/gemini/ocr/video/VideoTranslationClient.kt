@@ -170,6 +170,11 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             val terms=PhoneTranslationCache.parseGlossary(glossary)
             context.put("promptRevision",VideoDialoguePrompt.REVISION).put("profile",profile).put("glossary",JSONObject(terms))
             context.put("targetLanguage", batch.targetLanguage)
+            if (batch.strictDialogue && VideoDialoguePrompt.attachSceneNotes(dialogue, context.optString("filmContext"))) {
+                val thinking = if (batch.requestModel.startsWith("gemini-2.5-")) JSONObject().put("thinkingBudget", 512)
+                    else JSONObject().put("thinkingLevel", "low")
+                request.getJSONObject("generationConfig").put("thinkingConfig", thinking)
+            }
             if (batch.targetLanguage == "en") {
                 for (i in 0 until dialogue.length()) {
                     val row = dialogue.getJSONObject(i)
