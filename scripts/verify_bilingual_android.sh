@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${GEMINI_BENCHMARK_API_KEY:?Set the repository Actions secret first}"
+provider=${1:?Specify fixture or gemini}
+case "$provider" in
+  gemini) : "${GEMINI_BENCHMARK_API_KEY:?Set the repository Actions secret first}" ;;
+  fixture) ;;
+  *) exit 2 ;;
+esac
 : "${RUNNER_TEMP:?Run on the disposable CI emulator}"
 package=com.gemini.ocr.bilingualtest
 fixture=$(mktemp -d "$RUNNER_TEMP/bilingual.XXXXXX")
@@ -40,17 +45,17 @@ for phase in source recovery; do
   transfer dialogue.mp4 < dialogue.mp4
   transfer zh.srt < zh.srt
   transfer passphrase < passphrase
-  if [[ $phase == source ]]; then
+  if [[ $phase == source && $provider == gemini ]]; then
     printf '%s' "$GEMINI_BENCHMARK_API_KEY" | transfer credential
-  else
+  elif [[ $phase == recovery ]]; then
     transfer sealed.json < sealed.json
   fi
-  adb shell am instrument -w -e bilingualPhase "$phase" -e class com.gemini.ocr.video.BilingualVideoNativeTest \
+  adb shell am instrument -w -e bilingualProvider "$provider" -e bilingualPhase "$phase" -e class com.gemini.ocr.video.BilingualVideoNativeTest \
     "$package.test/androidx.test.runner.AndroidJUnitRunner" > "result-$phase"
   if ! grep -Fq 'OK (1 test)' "result-$phase"; then
     grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|FAILURES|Tests run' "result-$phase" | head -10
     exit 1
   fi
-  echo "Android Gemini integration passed: $phase"
+  echo "Android integration passed: provider=$provider phase=$phase"
   if [[ $phase == source ]]; then adb exec-out run-as "$package" cat files/sealed.json > sealed.json; fi
 done

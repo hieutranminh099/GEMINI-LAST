@@ -152,7 +152,8 @@ class VideoJobs internal constructor(
         require(!extractionChanged || !changesSpeech || old.cues.none { it.protectedText }) {
             "Tạo dự án mới trước khi thay nguồn hoặc vùng OCR để giữ các câu đã duyệt và sửa tay."
         }
-        val translationChanged=old.translationMode!=project.translationMode || old.glossary!=project.glossary || old.profile!=project.profile
+        val translationChanged=old.translationMode!=project.translationMode || old.glossary!=project.glossary ||
+            old.profile!=project.profile || old.dialogueContext!=project.dialogueContext
         val extractionPending=old.sourceExtractionPending
         val compatibleHybridCarry=project.translationMode==VideoTranslationMode.HYBRID &&
             (old.carry.optBoolean("visualScan") || old.carry.optInt("draftVersion")>=2)
@@ -168,6 +169,13 @@ class VideoJobs internal constructor(
             configured.copy(subtitleUri=store.retainSubtitle(project.id,Uri.parse(project.subtitleUri)).toString(),originalSubtitleUri=project.subtitleUri) else configured
         val next=when {
             extractionChanged->retained.copy(otherCues=emptyList(),pipeline=VideoPipelineCheckpoint(contextProfile=old.pipeline.contextProfile,contextRevision=old.pipeline.contextRevision,sharedRoiRevision=old.pipeline.sharedRoiRevision),cues=emptyList(),scanMs=0,carry=org.json.JSONObject(),speech=org.json.JSONObject(),ocrMetrics=org.json.JSONObject(),stage=VideoStage.READY,resumeStage=VideoStage.EXTRACTING,exportedMp4="",progress=0)
+            translationChanged && retained.translationMode != VideoTranslationMode.OFFLINE &&
+                retained.cues.any { it.translation.isNotBlank() } && !File(store.folder(old.id), "batch-owner").exists() ->
+                retained.copy(pipeline = retained.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),
+                    cues = retained.cues.map { if (it.protectedText || it.translation.isBlank()) it
+                        else it.copy(refinementState = "refresh") },
+                    stage = VideoStage.PAUSED, resumeStage = if (extractionPending) VideoStage.EXTRACTING else VideoStage.TRANSLATING,
+                    message = "Bấm Tiếp tục để dịch theo cấu hình mới. Giữ bản hiện tại đến khi Gemini trả đủ nhóm.")
             translationChanged->retained.copy(pipeline=retained.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),cues=retained.cues.map{if(it.protectedText)it else it.copy(translation="",model="",error="",localDraft="",refinementState="",draftVi="",polishedVi="")},stage=VideoStage.PAUSED,
                 resumeStage=if(extractionPending)VideoStage.EXTRACTING else VideoStage.TRANSLATING,exportedMp4="")
             else->retained.copy(exportedMp4=if(old.style!=project.style)"" else retained.exportedMp4)
@@ -212,14 +220,20 @@ class VideoJobs internal constructor(
             val settings = AppSettings(context)
             val batch = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(p.cues, index), p.dialogueContext).copy(targetLanguage = p.targetLanguage,
                 requestModel = settings.videoTextModel, strictDialogue = true)
-            val result = VideoTranslationClient(context).translate(settings.effectiveStandaloneApiKey(),
-                batch, p.profile, p.glossary) { check(busy.value == null) }
+            val economy = if (VideoSmartBatchSettings(context).economyMode) VideoEconomyBatch(context, id) else null
+            val dispatch: suspend () -> Unit = {
+                check(busy.value == null && !SessionState.running.value) { "Tạm dừng dịch trực tiếp trước khi dịch lại." }
+            }
+            val key = settings.effectiveStandaloneApiKey()
+            val result = economy?.translate(key, batch, p.profile, p.glossary, dispatch)
+                ?: VideoTranslationClient(context).translate(key, batch, p.profile, p.glossary, beforeDispatch = dispatch)
             val next = p.cues.toMutableList()
             next[index] = next[index].copy(translation = result.accepted.getValue(cueId), approved = false,
                 model = result.model, error = "", draftVi = "", polishedVi = "", refinementState = "done")
             check(busy.value == null && store.load(id).updatedAt == p.updatedAt) { "Dự án đã thay đổi. Mở lại câu trước khi thử lại." }
             store.save(p.copy(cues = next, exportedMp4 = "", stage = VideoStage.REVIEW,
                 pipeline = p.pipeline.invalidateFrom(BatchPipelineStage.POLISH))).also { refresh(); queueSync(it) }
+            economy?.acknowledge()
             return@withContext
         }
         store.save(p.copy(pipeline=p.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),cues=p.cues.map{if(it.id==cueId)it.copy(translation="",approved=false,model="",error="",localDraft="",refinementState="",draftVi="",polishedVi="") else it},stage=VideoStage.PAUSED,
@@ -772,6 +786,7 @@ class VideoJobs internal constructor(
                         val failedCloudIds=mutableSetOf<String>()
                         val splitRetriedIds=mutableSetOf<String>()
                         val stagedTranslation = pipelineStage == BatchPipelineStage.TRANSLATE
+                        val singleVideo = pipelineStage == null && !File(store.folder(id), "batch-owner").exists()
                         var firstCloudCandidate = 0
                         if(p.translationMode!=VideoTranslationMode.OFFLINE)while(true){
                             gate();val repairing=pendingRepair!=null
@@ -789,7 +804,7 @@ class VideoJobs internal constructor(
                             else selectedBatch
                             val batch = when {
                                 adaptiveGroup != null -> VideoTranslationClient.withCompactTargets(contextualBatch)
-                                pipelineStage == null -> contextualBatch.copy(targetLanguage = p.targetLanguage,
+                                singleVideo -> contextualBatch.copy(targetLanguage = p.targetLanguage,
                                     requestModel = AppSettings(context).videoTextModel, strictDialogue = true)
                                 else -> contextualBatch
                             }
@@ -839,6 +854,8 @@ class VideoJobs internal constructor(
                                 }.toMutableList()
                                 if(hybrid && outcome.truncated && bad.isEmpty())throw VideoApiException("TEXT_TRUNCATED",
                                     detail="Phản hồi bị giới hạn đầu ra nhưng chưa xác định được ID cần kiểm tra; nguồn và bản nháp được giữ.")
+                                if (batch.strictDialogue && bad.isNotEmpty()) throw VideoApiException("TEXT_INCOMPLETE_RESPONSE",
+                                    detail = "Gemini chưa dịch đúng toàn bộ nhóm. Bản trước được giữ; bấm thử lại.")
                                 val good=batch.cueIds.indices.filter{it !in bad}
                                 val accepted=good.map{outcome.accepted.getValue(batch.cueIds[it])}
                                 runCatching{smartMetrics.response(outcome.copy(
@@ -853,7 +870,7 @@ class VideoJobs internal constructor(
                                         p.pipeline.copy(stages = p.pipeline.stages +
                                             (BatchPipelineStage.TRANSLATE to task.copy(targetCueLimit = hybridTargetLimit)))
                                     } else p.pipeline
-                                    persist(p.copy(cues=updated,model=outcome.model,pipeline=recoveredPipeline,
+                                    persist(p.copy(cues=updated,model=outcome.model,pipeline=recoveredPipeline,exportedMp4="",
                                         progress=unstagedTranslationPercent(updated, hybrid)))
                                     if(!repairing && !batch.strictDialogue)runCatching{batchCache.save(p,batch,accepted,outcome.model)}
                                     if(!repairing)adaptiveGroup?.complete(batch.cueIds.size)

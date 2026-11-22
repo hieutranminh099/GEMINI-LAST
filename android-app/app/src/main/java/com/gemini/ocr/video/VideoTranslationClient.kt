@@ -241,7 +241,6 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                     val text = rawTranslation.trim()
                     if (text.isBlank() || text.length > 8000) continue
                     val source = sources.getValue(id)
-                    if (batch.strictDialogue) require(batch.cueIds[index] == id)
                     val processed = runCatching {
                         TranslationOutputGuard.validateModelOutput("zh", listOf(source), listOf(text), terms)
                         if (batch.targetLanguage == "en") text else StandaloneTranslator.applyGlossaryPostProcess(listOf(source), listOf(text), glossary, enrichWithBank = false).single()
@@ -255,7 +254,9 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                     accepted.remove(rows.getJSONObject(rows.length()-1).getString("id"))
                 if (batch.strictDialogue && (accepted.size != batch.cueIds.size || candidate.optString("finishReason") == "MAX_TOKENS"))
                     throw VideoApiException("TEXT_INCOMPLETE_RESPONSE", detail = "Gemini trả thiếu hoặc cắt câu. Kiểm tra nguồn và bấm thử lại.")
-                return Result(accepted, batch.cueIds.filterNot(accepted::containsKey), model, elapsedMs,
+                // A provider may shuffle complete rows. Map unique IDs back to source order before publishing.
+                val ordered = if (batch.strictDialogue) batch.cueIds.associateWith(accepted::getValue) else accepted
+                return Result(ordered, batch.cueIds.filterNot(accepted::containsKey), model, elapsedMs,
                     quotaWaitMs, GeminiGenerationMetrics.fromResponse(body),truncated=truncated)
             } catch (error: VideoApiException) { throw error }
             catch (error: Exception) {

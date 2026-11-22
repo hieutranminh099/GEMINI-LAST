@@ -175,7 +175,7 @@ data class VideoProject(
                 localDraft = "", refinementState = "", draftVi = "", polishedVi = ""))
                 .copy(startMs = cue.startMs, endMs = cue.endMs)
         }
-        val complete = next.isNotEmpty() && next.all { it.translation.isNotBlank() }
+        val complete = next.isNotEmpty() && next.all { it.translation.isNotBlank() && it.refinementState != "refresh" }
         return copy(targetLanguage = language, cues = next, otherCues = cues, otherMode = translationMode,
             translationMode = if (language == "en") VideoTranslationMode.GEMINI else otherMode,
             model = "", exportedMp4 = "", pipeline = pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),

@@ -27,7 +27,7 @@ object VideoTranslationPlan {
         (cue.refinementState!="done" || cue.translation.isBlank())
 
     fun isComplete(cue:VideoCue,hybrid:Boolean):Boolean = cue.protectedText ||
-        (cue.translation.isNotBlank() && (!hybrid || cue.refinementState=="done"))
+        (cue.translation.isNotBlank() && cue.refinementState != "refresh" && (!hybrid || cue.refinementState=="done"))
 
     fun hasUnexpectedCyrillic(text:String,glossary:String=""):Boolean = text.codePoints().anyMatch{codePoint->
         Character.UnicodeScript.of(codePoint)==Character.UnicodeScript.CYRILLIC &&
@@ -74,7 +74,7 @@ object VideoTranslationPlan {
         val indices=mutableListOf<Int>();var sourceChars=0;var draftChars=0
         for(index in startIndex until cues.size){
             val cue=cues[index]
-            if(cue.protectedText || !(if(hybrid)needsCloudRefinement(cue) else cue.translation.isBlank()))continue
+            if(isComplete(cue,hybrid))continue
             val draft=if(hybrid)cue.localDraft.ifBlank{cue.translation} else ""
             require(cue.source.isNotBlank() && cue.source.length<=MAX_SINGLE_SOURCE){"Câu nguồn quá dài hoặc rỗng; hãy sửa/chia câu trước khi dịch."}
             require(!hybrid || draft.isNotBlank()){"Tạo bản nháp local trước khi Gemini hiệu đính; chưa gửi nhóm này."}
@@ -158,7 +158,7 @@ object VideoTranslationPlan {
             if(!cue.protectedText)updated[index]=cue.copy(translation=translations[i].trim(),model=model,error="",
                 qualityFlags=cue.qualityFlags.filterNot{it=="TRANSLATION_NEEDS_REVIEW"},
                 localDraft=if(hybrid)cue.localDraft.ifBlank{batch.offlineDrafts[i]} else cue.localDraft,
-                refinementState=if(hybrid)"done" else cue.refinementState)
+                refinementState=if(hybrid)"done" else if(cue.refinementState=="refresh") "" else cue.refinementState)
         }
         return updated
     }

@@ -135,6 +135,18 @@ class DriveVideoRepositoryTest{
         catch(_:IllegalArgumentException){}
         assertEquals(count,server.requestCount)
     }
+    @Test fun expiredAccessTokenIsRefreshedOnceBeforeRetryingTheSameDriveRead()=runBlocking {
+        var refreshes=0
+        val repo=DriveVideoRepository(context, { "expired-fixture" }, api=server.url("/drive/v3/"),
+            uploadApi=server.url("/upload/drive/v3/"), refreshSyncToken={ rejected ->
+                assertEquals("expired-fixture",rejected); refreshes++; "new-fixture"
+            })
+        drive.rejectExpired=true
+        assertTrue(repo.list().isEmpty())
+        // The two queries list legacy and bilingual manifests independently.
+        assertEquals(2,refreshes)
+        assertEquals(listOf("Bearer expired-fixture","Bearer new-fixture","Bearer expired-fixture","Bearer new-fixture"),drive.authHeaders)
+    }
     @Test fun providerBodyIsNotCopiedIntoTheUserFacingError()=runBlocking{
         drive.forbidden=true
         try{repository.list();fail("must report denied Drive access")}
@@ -190,10 +202,13 @@ class DriveVideoRepositoryTest{
         val mediaContentRanges=mutableListOf<String>()
         var corruptMedia=false
         var forbidden=false
+        var rejectExpired=false
         var failManifestStart=false
         var onMediaSessionStarted:(()->Unit)?=null
         override fun dispatch(request:RecordedRequest):MockResponse{
             authHeaders+=request.getHeader("Authorization")
+            if(rejectExpired && request.getHeader("Authorization")=="Bearer expired-fixture")
+                return MockResponse().setResponseCode(401)
             if(forbidden)return MockResponse().setResponseCode(403).setBody("sensitive-provider-detail")
             val url=request.requestUrl!!
             if(request.method=="GET" && url.encodedPath=="/drive/v3/files"){

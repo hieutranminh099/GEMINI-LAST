@@ -29,6 +29,7 @@ jobs:
       - name: Start isolated Android
         run: |
           sudo chmod a+rw /dev/kvm
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           sdkmanager 'emulator' 'system-images;android-34;google_apis;x86_64'
           echo no | avdmanager create avd -n bilingual -k 'system-images;android-34;google_apis;x86_64'
           nohup "$ANDROID_HOME/emulator/emulator" -avd bilingual -no-window -no-snapshot -no-audio -gpu swiftshader_indirect > "$RUNNER_TEMP/emulator.log" 2>&1 &
@@ -36,7 +37,25 @@ jobs:
           adb shell input keyevent 82
           adb install android-app/app/build/outputs/apk/debug/app-debug.apk
           adb install android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+      - name: Check native media export and Android Keystore recovery with controlled translations
+        run: bash scripts/verify_bilingual_android.sh fixture
       - name: Exercise both languages, exports and clean installation key recovery
         env:
           GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
-        run: bash scripts/verify_bilingual_android.sh
+        run: bash scripts/verify_bilingual_android.sh gemini
+
+  windows-tests:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[verify-bilingual]')
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Companion tests with Windows DPAPI
+        run: |
+          python -m pip install pytest pytest-asyncio fastapi==0.115.12 uvicorn==0.34.2 "websockets>=14,<18" httpx==0.28.1 cryptography==44.0.3 qrcode==8.2 python-multipart==0.0.22 pillow psutil numpy
+          python -m pytest tests -q

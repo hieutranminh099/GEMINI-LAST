@@ -237,7 +237,7 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
     fun configure(next: VideoProject) {
         val old = project
         val resets = old != null && (old.cues.isNotEmpty() || old.scanMs > 0L) && (old.sourceMode != next.sourceMode || old.trackId != next.trackId ||
-            old.translationMode != next.translationMode || old.profile != next.profile || old.glossary != next.glossary)
+            old.translationMode != next.translationMode || old.dialogueContext != next.dialogueContext || old.profile != next.profile || old.glossary != next.glossary)
         if (resets) configurationChange = next else save(next)
     }
     fun openSettings() {

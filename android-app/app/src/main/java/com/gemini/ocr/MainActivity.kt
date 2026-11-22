@@ -373,7 +373,7 @@ class MainActivity : ComponentActivity() {
             OutlinedTextField(apiKeyInput, { apiKeyInput = it
                 try { settings.standaloneApiKey = it.trim(); keyError = "" }
                 catch (_: Exception) { keyError = "Chưa lưu được khóa vào Android Keystore. Thử nhập lại." } },
-                label = { Text("Khóa Gemini API") }, visualTransformation = PasswordVisualTransformation(), singleLine = true,
+                label = { Text("Khóa Gemini API") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password), singleLine = true,
                 enabled = !running, modifier = Modifier.fillMaxWidth().testTag("standalone_api_key_input"))
             Text(if (settings.effectiveStandaloneApiKey().isNotBlank()) "Đã cấu hình khóa Gemini API."
                 else if (videoKeyReady) "Đã cấu hình khóa cho video. Dịch trực tiếp cần khóa chính."

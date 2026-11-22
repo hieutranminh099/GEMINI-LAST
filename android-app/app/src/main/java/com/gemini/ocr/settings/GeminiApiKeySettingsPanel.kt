@@ -69,7 +69,7 @@ private fun SecondaryGeminiKey(settings: AppSettings, slot: Int, enabled: Boolea
     OutlinedTextField(input, {
         input = it
         status = ""
-    }, label = { Text("Khóa Gemini API $slot") }, visualTransformation = PasswordVisualTransformation(),
+    }, label = { Text("Khóa Gemini API $slot") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
         singleLine = true, enabled = enabled, modifier = Modifier.fillMaxWidth().testTag("gemini_api_key_$slot"))
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedButton(onClick = {

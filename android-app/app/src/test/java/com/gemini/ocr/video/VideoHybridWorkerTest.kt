@@ -124,8 +124,28 @@ class VideoHybridWorkerTest {
         assertEquals(0,result.cues.count{VideoTranslationPlan.isComplete(it,true)})
         assertEquals("pending",result.cues.first().refinementState)
         assertEquals("pending",result.cues.last().refinementState)
-        assertTrue(result.message.contains("TEXT_INVALID_RESPONSE"));assertEquals(p.durationMs,result.scanMs)
+        assertTrue(result.message.contains("TEXT_INCOMPLETE_RESPONSE"));assertEquals(p.durationMs,result.scanMs)
     }
+    @Test fun invalidFreshTranslationRetainsExistingTextAndMp4UntilAccepted()=runBlocking {
+        key()
+        val initial=full(2).copy(translationMode=VideoTranslationMode.GEMINI)
+        val previous=store.save(initial.copy(cues=initial.cues.map { it.copy(translation="Bản trước.",model="gemini") },
+            exportedMp4=File(store.folder(initial.id),"translated.mp4").apply { writeText("test export") }.path))
+        val jobs=VideoJobs(context)
+        jobs.save(previous.copy(dialogueContext="Same speakers in the kitchen."))
+        VideoTranslationClient.overrideResponseForTest={batch->body(batch.cueIds.take(1))}
+        val failed=run(previous)
+        assertEquals(VideoStage.FAILED,failed.stage)
+        assertEquals(previous.cues.map{it.translation},failed.cues.map{it.translation})
+        assertEquals(previous.exportedMp4,failed.exportedMp4)
+        assertEquals("test export",File(failed.exportedMp4).readText())
+        VideoTranslationClient.overrideResponseForTest={batch->body(batch.cueIds)}
+        val completed=run(failed)
+        assertEquals(VideoStage.REVIEW,completed.stage)
+        assertTrue(completed.cues.all{it.translation=="Xin chào."})
+        assertTrue(completed.exportedMp4.isEmpty())
+    }
+
     @Test fun ambiguousDuplicateIdsCannotOverwriteAnySavedCueOrTriggerAutomaticRepair()=runBlocking {
         key();val p=full(3);var calls=0
         VideoTranslationClient.overrideResponseForTest={batch->calls++;body(listOf(batch.cueIds[0],batch.cueIds[0]))}

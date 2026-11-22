@@ -34,7 +34,7 @@ class VideoSmartBatchWorkerTest {
     private fun body(ids: List<String>) = JSONObject().put("candidates", JSONArray().put(JSONObject().put("finishReason", "STOP")
         .put("content", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", JSONObject()
             .put("translations", JSONArray(ids.map { JSONObject().put("id", it).put("translation", "Bản Việt $it") })).toString())))))).toString()
-    @Test fun partialResponseIsCheckpointedAndOnlyMissingIdsAreRetried() = runBlocking {
+    @Test fun partialInteractiveResponseKeepsApprovedTextAndRetriesTheGroupOnResume() = runBlocking {
         SessionState.running.value = false
         configuredSyntheticKey()
         val store = VideoStore(context)
@@ -47,10 +47,9 @@ class VideoSmartBatchWorkerTest {
         VideoTranslationClient.overrideResponseForTest = { batch ->
             requests += batch.cueIds
             if (requests.size == 1) body(listOf("cue-3", "cue-1")) else {
-                assertEquals(listOf("cue-2"), batch.cueIds)
+                assertEquals(listOf("cue-1", "cue-2", "cue-3"), batch.cueIds)
                 val saved = store.load(project.id)
-                assertEquals("Bản Việt cue-1", saved.cues[1].translation)
-                assertEquals("Bản Việt cue-3", saved.cues[3].translation)
+                assertTrue(saved.cues.drop(1).all { it.translation.isEmpty() })
                 body(batch.cueIds)
             }
         }
@@ -58,13 +57,17 @@ class VideoSmartBatchWorkerTest {
             val jobs = VideoJobs(context); val finished = CompletableDeferred<Unit>()
             jobs.execute(project.id, false) { finished.complete(Unit) }
             withTimeout(15_000) { finished.await() }
+            assertEquals(VideoStage.FAILED, store.load(project.id).stage)
+            val retry = CompletableDeferred<Unit>()
+            jobs.execute(project.id, false) { retry.complete(Unit) }
+            withTimeout(15_000) { retry.await() }
             val result = store.load(project.id)
             assertEquals(result.message, VideoStage.REVIEW, result.stage)
             assertEquals(cues[0], result.cues[0]); assertEquals(2, requests.size)
             assertEquals(2, result.cloudCalls); assertTrue(result.cues.drop(1).all { it.translation.isNotBlank() && !it.approved })
         } finally { VideoTranslationClient.overrideResponseForTest = null }
     }
-    @Test fun missingIdStillMissingAfterOneRetryFailsWithoutLosingAcceptedRows() = runBlocking {
+    @Test fun missingInteractiveIdReportsRetryableErrorAndKeepsAllTargetsPending() = runBlocking {
         SessionState.running.value = false
         configuredSyntheticKey()
         val store = VideoStore(context)
@@ -79,10 +82,10 @@ class VideoSmartBatchWorkerTest {
             jobs.execute(p.id, false) { finished.complete(Unit) }
             withTimeout(15_000) { finished.await() }
             val result = store.load(p.id)
-            assertEquals(2, calls); assertEquals(VideoStage.FAILED, result.stage)
-            assertTrue(result.cues.first().translation.isNotBlank())
+            assertEquals(1, calls); assertEquals(VideoStage.FAILED, result.stage)
+            assertTrue(result.cues.first().translation.isBlank())
             assertTrue(result.cues.last().translation.isBlank()); assertTrue(result.cues.last().error.isNotBlank())
-            assertEquals(listOf("cue-1"), VideoTranslationPlan.nextCloudBatch(result.cues, false)!!.cueIds)
+            assertEquals(listOf("cue-0", "cue-1"), VideoTranslationPlan.nextCloudBatch(result.cues, false)!!.cueIds)
         } finally { VideoTranslationClient.overrideResponseForTest = null }
     }
     @Test fun quotaFailureIsNotRetriedAndCooldownSurvivesWorkerReconstruction() = runBlocking {

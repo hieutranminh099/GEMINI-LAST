@@ -66,7 +66,7 @@ fun VideoSyncPanel(enabled:Boolean,projectId:String?=null,onRestored:(VideoProje
             OutlinedButton(onClick={action{snapshots=sync.listCloud();notice="Có ${snapshots.size} bản lưu trên Drive."}},enabled=available && state.accountEmail.isNotBlank(),modifier=Modifier.testTag("video_cloud_library")){Text("Xem dự án trên tài khoản này")}
             if (state.accountEmail.isNotBlank()) {
                 OutlinedTextField(password, { if (it.length <= 256) password = it }, singleLine = true,
-                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
                     label = { Text("Mật khẩu khôi phục Gemini · ít nhất 12 ký tự") })
                 for (restore in listOf(false, true)) {
                     OutlinedButton(onClick = {

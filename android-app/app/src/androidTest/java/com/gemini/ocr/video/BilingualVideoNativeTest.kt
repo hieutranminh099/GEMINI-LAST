@@ -12,6 +12,7 @@ import com.gemini.ocr.settings.AppSettings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -22,7 +23,7 @@ import java.io.File
 /** Opt in only on a new, disposable emulator. Drive transport is tested separately. */
 @RunWith(AndroidJUnit4::class)
 class BilingualVideoNativeTest {
-    @Test fun translateExportAndRecover() = runBlocking {
+    @Test fun translateExportAndRecover(): Unit = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue(args.getString("bilingualPhase") in setOf("source", "recovery"))
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -34,18 +35,34 @@ class BilingualVideoNativeTest {
         check(passwordFile.delete())
         val recoveryFile = File(context.filesDir, "sealed.json")
         val sourcePhase = args.getString("bilingualPhase") == "source"
+        val simulate = args.getString("bilingualProvider") == "fixture"
+        if (simulate) {
+            VideoTranslationClient.overrideResponseForTest = { batch ->
+                val lines = if (batch.targetLanguage == "en") listOf("My mom is the homeroom teacher.",
+                    "Ms. Liu, you made so many dishes.", "Let me help you with the dishes.")
+                    else listOf("Mẹ tôi là giáo viên chủ nhiệm.", "Cô Lưu, cô nấu nhiều món quá.", "Để em rửa bát giúp cô ạ.")
+                val rows = JSONArray(batch.indices.mapIndexed { i, index ->
+                    JSONObject().put("id", batch.cueIds[i]).put("translation", lines[index])
+                })
+                val parts = JSONArray().put(JSONObject().put("text", JSONObject().put("translations", rows).toString()))
+                JSONObject().put("candidates", JSONArray().put(JSONObject().put("finishReason", "STOP")
+                    .put("content", JSONObject().put("parts", parts)))).toString()
+            }
+        }
         try {
             if (sourcePhase) {
                 val credential = File(context.filesDir, "credential")
-                settings.standaloneApiKey = credential.readText()
-                check(credential.delete())
+                if (simulate) settings.standaloneApiKey = "synthetic-offline-fixture" else {
+                    settings.standaloneApiKey = credential.readText()
+                    check(credential.delete())
+                }
                 settings.videoTextModel = "gemini-2.5-flash"
             } else {
                 require(!File(context.filesDir, "credential").exists())
                 settings.restoreGemini(JSONObject(recoveryFile.readText()), password)
                 assertEquals("gemini-2.5-flash", settings.videoTextModel)
             }
-            VideoTranslationClient(context).checkModel()
+            if (!simulate) VideoTranslationClient(context).checkModel()
             val jobs = VideoJobs.get(context)
             val video = File(context.filesDir, "dialogue.mp4")
             val subtitle = File(context.filesDir, "zh.srt")
@@ -114,7 +131,13 @@ class BilingualVideoNativeTest {
                     }
                 }
             }
-            if (sourcePhase) recoveryFile.writeText(settings.backupGemini(password).toString())
-        } finally { password.fill('\u0000') }
+            if (sourcePhase) {
+                val sealed = settings.backupGemini(password)
+                recoveryFile.writeText(sealed.toString())
+                settings.standaloneApiKey = ""
+                assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
+                assertFalse(settings.hasGeminiVideoKey())
+            }
+        } finally { VideoTranslationClient.overrideResponseForTest = null; password.fill('\u0000') }
     }
 }
