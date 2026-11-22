@@ -91,6 +91,36 @@ class DriveVideoRepositoryTest{
         assertEquals(restored.uri,restored.originalSourceUri)
         assertEquals(VideoStage.REVIEW,restored.stage)
     }
+    @Test fun bilingualSnapshotRestoresSelectionAndTheApprovedVietnameseTrack()=runBlocking {
+        val vi=project()
+        val en=vi.selectTarget("en").copy(cues=vi.cues.map { it.copy(translation="Hello", approved=false) })
+        val saved=repository.publish(en)
+        assertEquals(saved.fileId, repository.list().single().fileId)
+        val restored=repository.restore(saved)
+        assertEquals("en",restored.targetLanguage)
+        assertEquals("Hello",restored.cues.single().translation)
+        assertEquals(vi.cues,restored.selectTarget("vi").cues)
+    }
+
+    @Test fun encryptedSettingsRoundTripRequiresPasswordAndDetectsTampering()=runBlocking {
+        val password="synthetic recovery phrase".toCharArray()
+        val plain="synthetic credential for test".toByteArray()
+        val envelope=com.gemini.ocr.settings.GeminiRecovery.seal(plain,password)
+        repository.publishGemini(envelope)
+        assertTrue(drive.content.values.none { it.toString(Charsets.UTF_8).contains("synthetic") })
+        assertTrue(drive.metadata.values.none { it.toString().contains("synthetic") })
+        val restored=repository.latestGemini()
+        assertArrayEquals(plain,com.gemini.ocr.settings.GeminiRecovery.open(restored,password))
+        assertThrows(IllegalArgumentException::class.java) {
+            com.gemini.ocr.settings.GeminiRecovery.open(restored,"incorrect password".toCharArray())
+        }
+        val cipher=java.util.Base64.getDecoder().decode(restored.getString("data"))
+        cipher[0]=(cipher[0].toInt() xor 1).toByte()
+        restored.put("data",java.util.Base64.getEncoder().encodeToString(cipher))
+        assertThrows(IllegalArgumentException::class.java) { com.gemini.ocr.settings.GeminiRecovery.open(restored,password) }
+        Unit
+    }
+
     @Test fun corruptCloudMediaIsRejectedBeforeAProjectIsPublishedLocally()=runBlocking{
         val original=project();val cloud=repository.publish(original)
         val before=store.list().map{it.id}.toSet()
@@ -173,9 +203,11 @@ class DriveVideoRepositoryTest{
                     val props=meta.getJSONObject("appProperties")
                     val kind=props.getString("kind")
                     if(q.contains("value='manifest'") && kind!="manifest")continue
+                    if(q.contains("value='bilingual-manifest'") && kind!="bilingual-manifest")continue
+                    if(q.contains("value='gemini-settings'") && kind!="gemini-settings")continue
                     if(q.contains("value='media'") && kind!="media")continue
                     if(q.contains("key='sha256'") && !q.contains("value='${props.getString("sha256")}'"))continue
-                    rows.put(JSONObject().put("id",id).put("name",meta.getString("name"))
+                    rows.put(JSONObject().put("id",id).put("name",meta.getString("name")).put("createdTime","2026-01-01T00:00:00Z")
                         .put("size",content.getValue(id).size.toString()).put("appProperties",props))
                 }
                 return MockResponse().setBody(JSONObject().put("files",rows).toString())
@@ -207,6 +239,10 @@ class DriveVideoRepositoryTest{
             }
             if(request.method=="GET" && url.encodedPath.startsWith("/drive/v3/files/")){
                 val id=url.pathSegments.last();var bytes=content[id]?:return MockResponse().setResponseCode(404)
+                if(url.queryParameter("fields")=="size,sha256Checksum") {
+                    val digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}
+                    return MockResponse().setBody(JSONObject().put("size",bytes.size).put("sha256Checksum",digest).toString())
+                }
                 if(corruptMedia && metadata.getValue(id).getJSONObject("appProperties").getString("kind")=="media"){
                     bytes=bytes.clone();bytes[0]=(bytes[0]+1).toByte()
                 }

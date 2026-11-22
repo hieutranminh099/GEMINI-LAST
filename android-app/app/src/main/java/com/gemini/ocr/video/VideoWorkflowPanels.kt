@@ -89,7 +89,7 @@ internal fun VideoSetupPanel(project: VideoProject, enabled: Boolean, keyReady: 
                         VideoTranslationMode.OFFLINE to "Trên thiết bị · không cần mạng sau khi chuẩn bị",
                         VideoTranslationMode.GEMINI to "Gemini · cần mạng",
                         VideoTranslationMode.HYBRID to "Local + Gemini · toàn bộ hội thoại"
-                    ), enabled, { onSave(project.copy(translationMode = it)) }, "video_mode_choice")
+                    ), enabled && project.targetLanguage == "vi", { onSave(project.copy(translationMode = it)) }, "video_mode_choice")
                     if (project.translationMode != VideoTranslationMode.OFFLINE) {
                         Text(if (project.translationMode == VideoTranslationMode.HYBRID)
                             "Quét hết video trên thiết bị (100% thời lượng), lưu nguồn và mốc thời gian, rồi gửi Gemini. Hội thoại vừa giới hạn dùng một lượt; phần dài được tự chia thành ít lượt nhất theo ngân sách, giữ kết quả đã xong. Kết quả OCR vẫn cần đối chiếu."
@@ -178,6 +178,12 @@ internal fun VideoSetupPanel(project: VideoProject, enabled: Boolean, keyReady: 
                         Text("Chỉ bật khi tài khoản/model hỗ trợ. Google xử lý bất đồng bộ; bấm Tiếp tục để lấy kết quả. Tạm dừng ứng dụng giữ mã tác vụ, không tự gửi lại hoặc đổi sang dịch nhanh.",style=MaterialTheme.typography.bodySmall)
                         TextButton(onClick=onCancelEconomy,enabled=enabled){Text("Hủy tác vụ Gemini nền của video này")}
                     }
+                }
+                var scene by rememberSaveable(project.id, project.dialogueContext) { mutableStateOf(project.dialogueContext) }
+                OutlinedTextField(scene, { if (it.length <= 4000) scene = it }, enabled = enabled,
+                    label = { Text("Bối cảnh, nhân vật và quan hệ đã xác nhận") }, minLines = 2)
+                if (scene != project.dialogueContext) TextButton(onClick = { onSave(project.copy(dialogueContext = scene)) }, enabled = enabled) {
+                    Text("Lưu bối cảnh cho cả hai ngôn ngữ")
                 }
                 VideoGlossary(project, enabled) { onSave(project.copy(glossary = it)) }
                 if (project.sourceMode == VideoSourceMode.OCR && project.translationMode == VideoTranslationMode.GEMINI) {

@@ -17,14 +17,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 @Composable
-fun VideoSyncPanel(enabled:Boolean,onRestored:(VideoProject)->Unit) {
+fun VideoSyncPanel(enabled:Boolean,projectId:String?=null,onRestored:(VideoProject)->Unit) {
     val context=LocalContext.current
     val sync=remember{VideoCloudSync.get(context)}
     val state by sync.state.collectAsState()
     val scope=rememberCoroutineScope()
     var notice by remember{mutableStateOf("")}
-    var snapshots by remember{mutableStateOf<List<CloudVideoSnapshot>>(emptyList())}
+    var snapshots by remember(state.accountEmail){mutableStateOf<List<CloudVideoSnapshot>>(emptyList())}
     var working by remember{mutableStateOf(false)}
+    var password by remember(state.accountEmail) { mutableStateOf("") }
     var expanded by rememberSaveable{mutableStateOf(false)}
     fun action(block:suspend ()->Unit){scope.launch {
         working=true;notice=""
@@ -50,6 +51,10 @@ fun VideoSyncPanel(enabled:Boolean,onRestored:(VideoProject)->Unit) {
                 val pending=sync.authorize(selectAccount=true)
                 if(pending!=null)resolution.launch(IntentSenderRequest.Builder(pending.intentSender).build())
             }},enabled=available,modifier=Modifier.testTag("video_google_connect")){Text("Chọn / đổi tài khoản Google")}
+            if (projectId != null) OutlinedButton(
+                onClick = { action { sync.backupProject(projectId) } },
+                enabled = available && state.accountEmail.isNotBlank()
+            ) { Text("Sao lưu riêng dự án này") }
             Row {
                 Checkbox(state.enabled,onCheckedChange={sync.setEnabled(it)},enabled=available && state.accountEmail.isNotBlank())
                 Text("Tự đồng bộ sau khi dịch và chỉnh sửa")
@@ -59,9 +64,23 @@ fun VideoSyncPanel(enabled:Boolean,onRestored:(VideoProject)->Unit) {
                 Text("Chỉ tải lên qua Wi-Fi / mạng không tính phí")
             }
             OutlinedButton(onClick={action{snapshots=sync.listCloud();notice="Có ${snapshots.size} bản lưu trên Drive."}},enabled=available && state.accountEmail.isNotBlank(),modifier=Modifier.testTag("video_cloud_library")){Text("Xem dự án trên tài khoản này")}
+            if (state.accountEmail.isNotBlank()) {
+                OutlinedTextField(password, { if (it.length <= 256) password = it }, singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    label = { Text("Mật khẩu khôi phục Gemini · ít nhất 12 ký tự") })
+                for (restore in listOf(false, true)) {
+                    OutlinedButton(onClick = {
+                        val secret = password.toCharArray()
+                        password = ""
+                        action { sync.geminiSettings(secret, restore) }
+                    }, enabled = available && password.length >= 12) {
+                        Text(if (restore) "Mở khóa cấu hình Gemini từ Drive" else "Sao lưu cấu hình Gemini đã mã hóa")
+                    }
+                }
+            }
             snapshots.forEach{snapshot->
                 OutlinedButton(onClick={action{onRestored(sync.restore(snapshot));notice="Đã tải bản lưu thành dự án riêng trong máy."}},enabled=available){
-                    Text("Tải về · ${snapshot.title} · ${snapshot.sourceBytes/1024/1024} MiB")
+                    Text("Tải về · ${snapshot.title} · ${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(snapshot.updatedAt))} · ${snapshot.sourceBytes/1024/1024} MiB")
                 }
             }
             if(working || state.busy)LinearProgressIndicator(Modifier.fillMaxWidth())

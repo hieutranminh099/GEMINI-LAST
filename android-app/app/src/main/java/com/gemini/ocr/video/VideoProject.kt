@@ -117,9 +117,10 @@ enum class SubtitleFrameHandle(val left: Boolean = false, val top: Boolean = fal
 data class VideoSubtitleStyle(val position: Float = .86f, val sizeFraction: Float = .045f,
     val background: Boolean = false, val outline: Boolean = true, val frame: VideoSubtitleFrame? = null,
     val blurOriginal: Boolean = true, val yellowText: Boolean = true,
-    val legacyDefault: Boolean = false) {
+    val legacyDefault: Boolean = false, val coverOriginal: Boolean = false) {
     fun json(): JSONObject = JSONObject().put("position", position).put("sizeFraction", sizeFraction)
         .put("background", background).put("outline", outline).put("frame", frame?.json() ?: JSONObject.NULL)
+        .also { if (coverOriginal) it.put("coverOriginal", true) }
         .also { if (!legacyDefault) it.put("blurOriginal", blurOriginal).put("yellowText", yellowText) }
     /** Rendering upgrades the old stock preset without rewriting a confirmed library snapshot. */
     fun displayStyle(): VideoSubtitleStyle = if (legacyDefault && background && outline && frame == null &&
@@ -134,7 +135,7 @@ data class VideoSubtitleStyle(val position: Float = .86f, val sizeFraction: Floa
                 j.optDouble("position", .86).toFloat().coerceIn(.05f,.95f),
                 j.optDouble("sizeFraction", .045).toFloat().coerceIn(.02f,.09f),
                 j.optBoolean("background",true),j.optBoolean("outline",true),VideoSubtitleFrame.from(j.optJSONArray("frame")),
-                j.optBoolean("blurOriginal",false),j.optBoolean("yellowText",false),legacyAppearance)
+                j.optBoolean("blurOriginal",false),j.optBoolean("yellowText",false),legacyAppearance,j.optBoolean("coverOriginal"))
         }
     }
 }
@@ -156,8 +157,58 @@ data class VideoProject(
     val ocrMetrics: JSONObject = JSONObject(), val visualSampleMs: Long = 250,
     val pipeline: VideoPipelineCheckpoint = VideoPipelineCheckpoint(),
     val offlinePolishPolicy: VideoPolishPolicy = VideoPolishPolicy.NONE,
-    val speech: JSONObject = JSONObject()
+    val speech: JSONObject = JSONObject(),
+    val targetLanguage: String = "vi",
+    val otherCues: List<VideoCue> = emptyList(),
+    val otherMode: VideoTranslationMode = VideoTranslationMode.GEMINI,
+    val dialogueContext: String = ""
 ) {
+    init { require(targetLanguage in setOf("vi", "en") && dialogueContext.length <= 4000) }
+    internal fun selectTarget(language: String): VideoProject {
+        require(language in setOf("vi", "en"))
+        if (language == targetLanguage) return this
+        require(!sourceExtractionPending || scanMs == 0L) { "Nhận xong phụ đề nguồn trước khi chuyển ngôn ngữ." }
+        val saved = otherCues.associateBy { it.id }
+        val next = cues.map { cue ->
+            val previous = saved[cue.id]?.takeIf { it.source == cue.source }
+            (previous ?: cue.copy(translation = "", approved = false, model = "", error = "",
+                localDraft = "", refinementState = "", draftVi = "", polishedVi = ""))
+                .copy(startMs = cue.startMs, endMs = cue.endMs)
+        }
+        val complete = next.isNotEmpty() && next.all { it.translation.isNotBlank() }
+        return copy(targetLanguage = language, cues = next, otherCues = cues, otherMode = translationMode,
+            translationMode = if (language == "en") VideoTranslationMode.GEMINI else otherMode,
+            model = "", exportedMp4 = "", pipeline = pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),
+            stage = if (complete) VideoStage.REVIEW else VideoStage.READY,
+            resumeStage = if (next.isEmpty() || sourceExtractionPending) VideoStage.EXTRACTING else VideoStage.TRANSLATING,
+            progress = if (complete) 100 else 0,
+            message = if (complete) "Đã mở bản dịch đã lưu." else "Bấm Bắt đầu để dịch bản đã chọn.")
+    }
+
+    /** The editor confirms that these adjacent fragments belong to a single turn. */
+    internal fun joinNext(id: String): VideoProject {
+        val index = cues.indexOfFirst { it.id == id }
+        require(index >= 0 && index < cues.lastIndex)
+        val first = cues[index]
+        val second = cues[index + 1]
+        val source = first.source.trimEnd() + second.source.trimStart()
+        fun merge(rows: List<VideoCue>): List<VideoCue> {
+            val a = rows.firstOrNull { it.id == first.id } ?: return rows.filterNot { it.id == second.id }
+            val b = rows.firstOrNull { it.id == second.id }
+            val translated = if (a.translation.isNotBlank() && b != null && b.translation.isNotBlank())
+                a.translation.trimEnd() + " " + b.translation.trimStart() else ""
+            val merged = a.copy(source = source, rawZh = first.rawZh.ifBlank { first.source } + second.rawZh.ifBlank { second.source },
+                correctedZh = source, startMs = first.startMs, endMs = second.endMs, translation = translated,
+                approved = false, model = if (translated.isBlank()) "" else "user-edited",
+                draftVi = "", polishedVi = "", localDraft = "", refinementState = "", error = "",
+                version = maxOf(a.version, b?.version ?: 0) + 1)
+            return VideoTimeline.validate(rows.filterNot { it.id == second.id }.map { if (it.id == first.id) merged else it }, durationMs)
+        }
+        return copy(cues = merge(cues), otherCues = merge(otherCues), exportedMp4 = "",
+            pipeline = pipeline.invalidateFrom(BatchPipelineStage.CLEAN), stage = VideoStage.REVIEW,
+            resumeStage = VideoStage.TRANSLATING)
+    }
+
     val sourceExtractionPending get()=(scanMs<durationMs && resumeStage==VideoStage.EXTRACTING) ||
         (speech.optBoolean("asrActive") && !speech.optBoolean("complete")) ||
         (sourceMode == VideoSourceMode.AUTO && speech.optBoolean("probeComplete") &&
@@ -171,6 +222,13 @@ data class VideoProject(
         .put("roi",JSONArray(roi)).put("style",style.json()).put("stage",stage.name)
         .put("resumeStage",resumeStage.name).put("progress",progress).put("message",message)
         .also { if (includeCues) it.put("cues", JSONArray(cues.map { cue -> cue.json() })) }
+        .also {
+            if (dialogueContext.isNotBlank()) it.put("dialogueContext", dialogueContext)
+            if (targetLanguage != "vi" || otherCues.isNotEmpty() || otherMode != VideoTranslationMode.GEMINI) {
+                it.put("targetLanguage", targetLanguage).put("otherMode", otherMode.name)
+                    .put("otherCues", JSONArray(otherCues.map { cue -> cue.json(false) }))
+            }
+        }
         .put("scanMs",scanMs).put("carry",carry)
         .put("glossary",glossary).put("profile",profile).put("model",model)
         .put("elapsedMs",elapsedMs).put("maxPssKiB",maxPssKiB).put("updatedAt",updatedAt)
@@ -204,7 +262,11 @@ data class VideoProject(
                 VideoPipelineCheckpoint.from(j.optJSONObject("pipeline")),
                 if (j.getString("translationMode") == VideoTranslationMode.OFFLINE.name)
                     VideoPolishPolicy.fromPersisted(j.optString("offlinePolishPolicy")) else VideoPolishPolicy.NONE,
-                j.optJSONObject("speech") ?: JSONObject())
+                j.optJSONObject("speech") ?: JSONObject(), j.optString("targetLanguage", "vi"),
+                j.optJSONArray("otherCues")?.let { alternate ->
+                    require(alternate.length() <= MAX_CUES)
+                    VideoTimeline.validate(List(alternate.length()) { VideoCue.from(alternate.getJSONObject(it)) }, j.getLong("durationMs"))
+                }.orEmpty(), VideoTranslationMode.valueOf(j.optString("otherMode", "GEMINI")), j.optString("dialogueContext"))
         }
     }
 }

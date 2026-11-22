@@ -109,6 +109,7 @@ data class MovieSourceSnapshot(
             if (!style.legacyDefault) {
                 listOf("subtitle-appearance-v2", style.blurOriginal, style.yellowText).forEach(::field)
             }
+            if (style.coverOriginal) field("opaque-source-cover-v1")
             if (sourceRoi != listOf(.06f, .72f, .94f, .96f) || sourceMode != VideoSourceMode.AUTO) {
                 listOf("source-region-v1", sourceMode.name).forEach(::field)
                 sourceRoi.forEach(::field)

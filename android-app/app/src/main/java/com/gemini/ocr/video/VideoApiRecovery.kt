@@ -236,6 +236,7 @@ internal object VideoApiRecovery {
             detail = "Dịch vụ không chấp nhận khóa API (HTTP 400). Kiểm tra khóa và quyền API; tiến độ đã lưu.")
         return when (status) {
             401, 403 -> VideoApiException("API_AUTH", detail = "Dịch vụ chưa cho phép truy cập (HTTP $status). Kiểm tra khóa và quyền API.")
+            404 -> VideoApiException("API_MODEL", detail = "Model chưa có hoặc khóa chưa được cấp quyền. Chọn model khác trong Tùy chỉnh.")
             429 -> if (quotaExhausted(body)) VideoApiException("API_QUOTA_EXHAUSTED",
                 detail = "Đã hết hạn mức dịch vụ (HTTP 429); không tự gửi lại. Tiến độ đã lưu.")
             else VideoApiException("API_RATE_LIMIT", true, wait,

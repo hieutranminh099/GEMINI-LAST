@@ -56,7 +56,8 @@ internal class DriveVideoRepository(
     private val gate:suspend()->Unit={},
     private val progressWriterId:String=installationWriterId(context),
     private val refreshPlaybackToken:(suspend (String)->String)?=null,
-    private val playbackAccountGuard:()->Unit={}
+    private val playbackAccountGuard:()->Unit={},
+    private val refreshSyncToken:(suspend (String)->String)?=null
 ) {
     private val store=VideoStore(context)
     private data class LocalMedia(val role:String,val size:Long,val sha:String,val mime:String,val open:()->InputStream)
@@ -89,13 +90,31 @@ internal class DriveVideoRepository(
             val bytes=envelope.toString().toByteArray(Charsets.UTF_8)
             require(bytes.size<=MAX_MANIFEST){"Dự án quá lớn để sao lưu (32 MiB)."}
             val local=LocalMedia("manifest",bytes.size.toLong(),hash(bytes),"application/json"){bytes.inputStream()}
-            val id=upload(local,project.id,revision,project.title,project.updatedAt,media.first().size)
+            val kind = if (project.targetLanguage != "vi" || project.otherCues.isNotEmpty()) "bilingual-manifest" else "manifest"
+            val id=upload(local,project.id,revision,project.title,project.updatedAt,media.first().size,finalKind=kind)
             CloudVideoSnapshot(id,project.id,project.title,project.updatedAt,revision,media.first().size)
         }
     }
 
+    suspend fun publishGemini(envelope: JSONObject) = withContext(Dispatchers.IO) {
+        val bytes = envelope.toString().toByteArray(Charsets.UTF_8)
+        require(bytes.size <= 100_000)
+        val local = LocalMedia("gemini-settings", bytes.size.toLong(), hash(bytes), "application/json") { bytes.inputStream() }
+        upload(local, "settings", UUID.randomUUID().toString(), finalKind = "gemini-settings", verifyServer = true)
+    }
+
+    suspend fun latestGemini(): JSONObject = withContext(Dispatchers.IO) {
+        val entry = listFiles("appProperties has { key='kind' and value='gemini-settings' }")
+            .maxWithOrNull(compareBy<JSONObject>({ java.time.Instant.parse(it.getString("createdTime")) }, { it.getString("id") }))
+            ?: error("Tài khoản Drive chưa có bản sao cấu hình Gemini.")
+        val bytes = downloadBytes(entry.getString("id").also(::validId), 100_000)
+        require(hash(bytes) == entry.getJSONObject("appProperties").getString("sha256")) { "Bản sao Gemini tải về không toàn vẹn." }
+        JSONObject(bytes.toString(Charsets.UTF_8))
+    }
+
     suspend fun list():List<CloudVideoSnapshot> = withContext(Dispatchers.IO){
-        val files=listFiles("appProperties has { key='kind' and value='manifest' }")
+        val files=listFiles("appProperties has { key='kind' and value='manifest' }") +
+            listFiles("appProperties has { key='kind' and value='bilingual-manifest' }")
         files.mapNotNull{item->runCatching{
             val p=item.getJSONObject("appProperties")
             CloudVideoSnapshot(item.getString("id"),p.getString("projectId"),p.optString("title",item.optString("name")),
@@ -380,7 +399,7 @@ internal class DriveVideoRepository(
         do{
             val url=api.newBuilder().addPathSegment("files").addQueryParameter("spaces","appDataFolder")
                 .addQueryParameter("q","trashed = false and ($query)").addQueryParameter("pageSize","1000")
-                .addQueryParameter("fields","nextPageToken,files(id,name,size,appProperties)")
+                .addQueryParameter("fields","nextPageToken,files(id,name,size,createdTime,appProperties)")
             page?.let{url.addQueryParameter("pageToken",it)}
             val json=jsonRequest(Request.Builder().url(url.build()).get())
             val files=json.optJSONArray("files")?:JSONArray()
@@ -485,6 +504,7 @@ internal class DriveVideoRepository(
     private suspend fun jsonRequest(builder:Request.Builder):JSONObject=read(builder){checkResponse(it);JSONObject(readLimited(it,MAX_MANIFEST))}
     private suspend fun <T> read(builder:Request.Builder,block:suspend (Response)->T):T=withContext(Dispatchers.IO){
         var access=token();require(access.isNotBlank())
+        val refresh = refreshSyncToken ?: refreshPlaybackToken
         var refreshed=false
         while(true){
             playbackAccountGuard()
@@ -494,7 +514,7 @@ internal class DriveVideoRepository(
                 val cancellation=launch(start=CoroutineStart.UNDISPATCHED){try{awaitCancellation()}finally{call.cancel()}}
                 try{call.execute().use{response->
                     playbackAccountGuard()
-                    if(response.code==401 && !refreshed && refreshPlaybackToken!=null){retry=true;null}
+                    if(response.code==401 && !refreshed && refresh!=null){retry=true;null}
                     else {
                         if(refreshPlaybackToken!=null && !response.isSuccessful)throw DrivePlaybackException(when(response.code){
                             401->DrivePlaybackFailure.AUTH;403->DrivePlaybackFailure.FORBIDDEN;404->DrivePlaybackFailure.MISSING
@@ -509,7 +529,7 @@ internal class DriveVideoRepository(
                 return@withContext result as T
             }
             refreshed=true
-            access=requireNotNull(refreshPlaybackToken).invoke(access)
+            access=requireNotNull(refresh).invoke(access)
             require(access.isNotBlank())
         }
         @Suppress("UNREACHABLE_CODE") error("Unreachable")

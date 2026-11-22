@@ -358,6 +358,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SettingsScreen(running: Boolean, connectionRequest: Int = 0) {
         var apiKeyInput by remember { mutableStateOf(settings.standaloneApiKey) }
+        var keyError by remember { mutableStateOf("") }
         var keyRevision by remember { mutableIntStateOf(0) }
         val videoKeyReady = remember(apiKeyInput, keyRevision) { settings.hasGeminiVideoKey() }
         var localGlossary by remember { mutableStateOf(settings.localGlossary) }
@@ -369,12 +370,15 @@ class MainActivity : ComponentActivity() {
             else if (videoKeyReady) "Đã cấu hình khóa cho video" else "Chưa có khóa Gemini",
             initiallyExpanded = connectionRequest > 0 || settings.effectiveStandaloneApiKey().isBlank()) {
             Text("Nhập khóa của bạn để dịch câu mới bằng Gemini. Khóa được lưu bảo mật trên thiết bị.", color = Muted)
-            OutlinedTextField(apiKeyInput, { apiKeyInput = it; settings.standaloneApiKey = it.trim() },
+            OutlinedTextField(apiKeyInput, { apiKeyInput = it
+                try { settings.standaloneApiKey = it.trim(); keyError = "" }
+                catch (_: Exception) { keyError = "Chưa lưu được khóa vào Android Keystore. Thử nhập lại." } },
                 label = { Text("Khóa Gemini API") }, visualTransformation = PasswordVisualTransformation(), singleLine = true,
                 enabled = !running, modifier = Modifier.fillMaxWidth().testTag("standalone_api_key_input"))
             Text(if (settings.effectiveStandaloneApiKey().isNotBlank()) "Đã cấu hình khóa Gemini API."
                 else if (videoKeyReady) "Đã cấu hình khóa cho video. Dịch trực tiếp cần khóa chính."
                 else "Chưa có khóa. Bạn vẫn có thể tra các câu đã lưu trong Kho thoại.", color = Muted)
+            if (keyError.isNotEmpty()) Text(keyError)
             GeminiApiKeySettingsPanel(settings, enabled = !running, onChanged = { keyRevision++ })
         }
         }

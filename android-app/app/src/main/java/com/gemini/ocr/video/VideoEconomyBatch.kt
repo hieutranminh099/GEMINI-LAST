@@ -28,7 +28,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
     suspend fun translate(key: String, batch: VideoTranslationPlan.Batch, profile: String, glossary: String,
                           beforeDispatch: suspend () -> Unit): VideoTranslationClient.Result = withContext(Dispatchers.IO) {
         val payload=VideoTranslationClient.buildRequest(batch,profile,glossary)
-        val fingerprint=MessageDigest.getInstance("SHA-256").digest((StandaloneTranslator.FAST_MODEL+payload).toByteArray()).joinToString(""){"%02x".format(it)}
+        val fingerprint=MessageDigest.getInstance("SHA-256").digest((batch.requestModel+payload).toByteArray()).joinToString(""){"%02x".format(it)}
         var saved=if(checkpoint.baseFile.exists()) JSONObject(checkpoint.openRead().bufferedReader().use{it.readText()}) else null
         if(saved!=null) require(saved.getString("fingerprint")==fingerprint) {
             "Có tác vụ Gemini nền cho cấu hình khác. Giữ dự án cũ hoặc hủy tác vụ nền trước khi đổi thiết lập."
@@ -38,7 +38,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
             // Persist the submission intent first. A lost POST response must not spend quota again.
             saved=JSONObject().put("fingerprint",fingerprint).put("state","SUBMITTING")
                 .put("keyFingerprint", keyFingerprint(selected.key)).put("keySlot", selected.slot)
-            val result=exchange(selected.key,"models/${StandaloneTranslator.FAST_MODEL}:batchGenerateContent",createRequest(payload,fingerprint),beforeDispatch,saved)
+            val result=exchange(selected.key,"models/${batch.requestModel}:batchGenerateContent",createRequest(payload,fingerprint),beforeDispatch,saved)
             val name=result.getString("name").also{require(validName(it))}
             saved.put("name",name).put("state","PENDING");write(saved)
         }
@@ -46,7 +46,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
         val name=saved.getString("name").also{require(validName(it))}
         val result=exchange(selected.key,name,null,beforeDispatch)
         val response=completedResponse(result,fingerprint) ?: throw VideoEconomyPendingException()
-        val parsed=VideoTranslationClient.parseResponse(response.toString(),batch,glossary,StandaloneTranslator.FAST_MODEL)
+        val parsed=VideoTranslationClient.parseResponse(response.toString(),batch,glossary,batch.requestModel)
         saved.put("state","COMPLETE").put("acceptedIds",JSONArray(parsed.accepted.keys.toList()));write(saved)
         // Keep the completed response until the timeline checkpoint is durable; a resumed caller
         // can GET the same immutable job safely rather than resubmitting the POST.

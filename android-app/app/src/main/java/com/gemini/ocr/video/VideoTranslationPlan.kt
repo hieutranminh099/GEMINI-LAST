@@ -14,7 +14,10 @@ object VideoTranslationPlan {
         val indices:List<Int>,val cueIds:List<String>,val texts:List<String>,
         val offlineDrafts:List<String>,val videoContext:String,val maxOutputTokens:Int,
         val fullDialogue:Boolean=false,
-        val compactTargets:Boolean=false
+        val compactTargets:Boolean=false,
+        val targetLanguage:String="vi",
+        val requestModel:String=com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL,
+        val strictDialogue:Boolean=false
     )
 
     fun needsLocalDraft(cue:VideoCue,hybrid:Boolean):Boolean = !cue.protectedText && cue.translation.isBlank() &&
@@ -94,6 +97,8 @@ object VideoTranslationPlan {
         val repair=buildBatch(cues,hybrid,selected.indices)
         return repair.copy(videoContext=repair.videoContext.replaceFirst("{\"schema\":1,","{\"schema\":1,\"qualityRepair\":true,"))
     }
+
+    fun forCue(cues: List<VideoCue>, index: Int) = buildBatch(cues, false, listOf(index))
 
     private fun buildBatch(cues:List<VideoCue>,hybrid:Boolean,indices:List<Int>):Batch {
         require(indices.size in 1..MAX_CUES && indices.distinct().size==indices.size && indices.sorted()==indices &&

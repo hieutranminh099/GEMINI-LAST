@@ -150,3 +150,13 @@ Các script setup tải artifact/model công khai khi người dùng chạy rõ 
 | CTranslate2 / ONNX Runtime | [CTranslate2 MIT](https://github.com/OpenNMT/CTranslate2/blob/master/LICENSE), [ONNX Runtime MIT](https://github.com/microsoft/onnxruntime/blob/main/LICENSE). Chạy CPU trong tính năng này. |
 
 Font preview/test lấy từ font Windows có trên máy; không đóng gói lại các font Windows trong mã nguồn hay bộ cài.
+
+## Dự án video riêng trên Android
+
+Trong màn hình dự án, **Ngôn ngữ đích → English** chọn dịch lời thoại Trung bằng Gemini. **Tiếng Việt** mở bản Việt đã lưu. Hai bản dùng chung nguồn, mốc thời gian, từ điển và ghi chú nhân vật trong **Thiết lập → Tùy chọn nâng cao**. Có thể nối hai mảnh của cùng một lượt thoại trong trình sửa câu rồi dịch lại. Trong phần kiểu phụ đề, **Che kín toàn bộ vùng chữ gốc** áp dụng vùng nguồn đã chọn cho cả trình phát và MP4.
+
+Trong **Tùy chỉnh → Kết nối Gemini**, chọn model cho lời thoại video và kiểm tra kết nối. **Đồng bộ Google Drive → Thiết lập → Sao lưu riêng dự án này** lưu dự án đã dịch vào vùng dữ liệu ứng dụng của tài khoản đã cấp quyền. Mỗi lần khôi phục dự án tạo một bản riêng trên thiết bị.
+
+Để mang cấu hình Gemini sang thiết bị mới, nhập mật khẩu khôi phục dài ít nhất 12 ký tự và chọn **Sao lưu cấu hình Gemini đã mã hóa**. Trên thiết bị mới, dùng cùng tài khoản Drive và mật khẩu với **Mở khóa cấu hình Gemini từ Drive**. Cấu hình gồm model lời thoại, chế độ khóa, các ô khóa, cỡ nhóm và tùy chọn Batch API. Dữ liệu được mã hóa AES-256-GCM với khóa suy dẫn bằng PBKDF2-HMAC-SHA256, salt ngẫu nhiên và 600.000 vòng. Hãy giữ mật khẩu khôi phục riêng. Ứng dụng giữ các khóa đã đổi hoặc đã xóa trên thiết bị khi gặp bản sao khác.
+
+Android OAuth client cần khớp tên package và SHA-1 của APK chạy trên thiết bị. Trong Google Cloud project, bật Drive API và cấu hình người dùng thử nếu ứng dụng đang ở chế độ Testing. [Android Authorization](https://developer.android.com/identity/authorization) · [Drive appDataFolder](https://developers.google.com/workspace/drive/api/guides/appdata)

@@ -320,7 +320,7 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
         val id = pendingExportId; pendingExportId = ""
         if (uri != null && id.isNotEmpty()) action {
             withContext(Dispatchers.IO) { jobs.exportText(id, uri, false) }
-            lastSavedUri=uri.toString();lastSavedName=name(uri,"phu-de-vi.srt");lastSavedMime="application/x-subrip"
+            lastSavedUri=uri.toString();lastSavedName=name(uri,"phu-de.srt");lastSavedMime="application/x-subrip"
             notice = "Đã lưu SRT UTF-8: $lastSavedName tại nơi bạn chọn."
         }
     }
@@ -328,7 +328,7 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
         val id = pendingExportId; pendingExportId = ""
         if (uri != null && id.isNotEmpty()) action {
             withContext(Dispatchers.IO) { jobs.exportText(id, uri, true) }
-            lastSavedUri=uri.toString();lastSavedName=name(uri,"phu-de-vi.ass");lastSavedMime="text/x-ssa"
+            lastSavedUri=uri.toString();lastSavedName=name(uri,"phu-de.ass");lastSavedMime="text/x-ssa"
             notice = "Đã lưu ASS: $lastSavedName tại nơi bạn chọn."
         }
     }
@@ -336,14 +336,14 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
         val id = pendingExportId; pendingExportId = ""
         if (uri != null && id.isNotEmpty()) action {
             withContext(Dispatchers.IO) { jobs.copyMp4(id, uri) }
-            lastSavedUri=uri.toString();lastSavedName=name(uri,"video-vi.mp4");lastSavedMime="video/mp4"
-            notice = "Đã lưu MP4 có phụ đề Việt: $lastSavedName tại nơi bạn chọn. Video nguồn được giữ nguyên."
+            lastSavedUri=uri.toString();lastSavedName=name(uri,"video.mp4");lastSavedMime="video/mp4"
+            notice = "Đã lưu MP4 có phụ đề đã chọn: $lastSavedName tại nơi bạn chọn. Video nguồn được giữ nguyên."
         }
     }
 
     fun chooseTextDestination(p:VideoProject,ass:Boolean) {
         pendingExportId=p.id
-        val filename="${p.title.substringBeforeLast('.')}-vi.${if(ass)"ass" else "srt"}"
+        val filename="${p.title.substringBeforeLast('.')}-${p.targetLanguage}.${if(ass)"ass" else "srt"}"
         if(ass)exportAss.launch(filename) else exportSrt.launch(filename)
     }
     fun saveText(p:VideoProject,ass:Boolean) {
@@ -362,7 +362,7 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
         if(chooseFolder || !VideoDownloads.supportsDirectSave) {
             pendingExportId=p.id
             notice="Chọn Download hoặc thư mục bạn muốn để lưu MP4 đã tạo."
-            exportMp4.launch("${p.title.substringBeforeLast('.')}-vi.mp4")
+            exportMp4.launch("${p.title.substringBeforeLast('.')}-${p.targetLanguage}.mp4")
         } else action {
             val fresh=withContext(Dispatchers.IO){VideoStore(context).load(p.id)}
             val saved=VideoDownloads.saveRenderedMp4(context,fresh)
@@ -546,6 +546,13 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                             if (project.cues.isNotEmpty()) Text("Nguồn đã dùng: ${videoResolvedSourceLabel(project)}", style = MaterialTheme.typography.bodySmall,
                                 modifier = Modifier.testTag("video_resolved_source"))
+                            if (!File(VideoStore(context).folder(project.id), "batch-owner").exists()) {
+                                VideoChoiceRow("Ngôn ngữ đích", project.targetLanguage,
+                                    listOf("vi" to "Tiếng Việt", "en" to "English"), editable,
+                                    { language -> action { jobs.selectTarget(project.id, language) } }, "video_target_language")
+                            }
+                            VideoSyncPanel(enabled = editable, projectId = project.id,
+                                onRestored = { jobs.refresh(); selectedId = it.id; lastStage = "" })
                             VideoAsrOverlapReviewButton(project)
                             videoUnclearSpeechNotice(project)?.let { StatusNotice(it) }
                             OutlinedButton(onClick = {
@@ -648,7 +655,7 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
                                 } else if (!batchOwned) {
                                     Button(onClick = { confirmMovie = true }, enabled = editable && VideoExportReadiness.from(project).complete,
                                         modifier = Modifier.testTag("video_confirm_movie")) { Text("Lưu Kho phim · giữ nguyên bản gốc") }
-                                    Text("Phát video nguồn cùng phụ đề Việt. Không cần tạo MP4 hoặc lưu vào Downloads.", style = MaterialTheme.typography.bodySmall)
+                                    Text("Phát video nguồn cùng phụ đề đã chọn. Không cần tạo MP4 hoặc lưu vào Downloads.", style = MaterialTheme.typography.bodySmall)
                                 } else Text("Trở về dự án hàng loạt để xác nhận đúng danh sách tập vào Kho phim.", style = MaterialTheme.typography.bodySmall)
                                 }
                                 TextButton(onClick = { step = 3 }) { Text("Quay lại kiểm tra bản dịch") }
@@ -696,7 +703,9 @@ internal fun VideoWorkflowScreen(initialProjectId: String, initialStep: String, 
 
     val editing = project?.cues?.firstOrNull { it.id == editId }
     if (project != null && editing != null) CueEditor(editing, project.cues, project.durationMs,
-        onDismiss = { editId = "" }, onSave = { changed ->
+        onDismiss = { editId = "" }, onJoin = {
+            action { jobs.joinNext(project.id, editing.id, project.updatedAt); editId = "" }
+        }, onSave = { changed ->
             action {
                 withContext(Dispatchers.IO) { jobs.updateCue(project.id, changed) }
                 editId = ""
@@ -745,7 +754,7 @@ internal fun VideoExportCard(project:VideoProject,enabled:Boolean,hasRenderedMp4
             }
             HorizontalDivider(color = OceanColors.Outline.copy(alpha = .35f))
             Text("Tệp phụ đề", style = MaterialTheme.typography.titleSmall)
-            Text("SRT lưu câu chữ; ASS giữ cả kiểu phụ đề. MP4 là video có sẵn chữ Việt trong hình.",style=MaterialTheme.typography.bodySmall)
+            Text("SRT lưu câu chữ; ASS giữ cả kiểu phụ đề. MP4 là video có sẵn phụ đề trong hình.",style=MaterialTheme.typography.bodySmall)
             FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                 Button(onClick=onSrt,enabled=canExport,modifier=Modifier.widthIn(min=136.dp,max=260.dp).testTag("video_download_srt")){Text("Tải SRT về máy")}
                 OutlinedButton(onClick=onAss,enabled=canExport,modifier=Modifier.widthIn(min=136.dp,max=260.dp).testTag("video_download_ass")){Text("Tải ASS")}
@@ -808,11 +817,12 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     var size by rememberSaveable(project.id, project.style) { mutableFloatStateOf(initial.sizeFraction) }
     var background by rememberSaveable(project.id, project.style) { mutableStateOf(initial.background) }
     var outline by rememberSaveable(project.id, project.style) { mutableStateOf(initial.outline) }
+    var coverOriginal by rememberSaveable(project.id, project.style) { mutableStateOf(initial.coverOriginal) }
     var blurOriginal by rememberSaveable(project.id, project.style) { mutableStateOf(initial.blurOriginal) }
     var yellowText by rememberSaveable(project.id, project.style) { mutableStateOf(initial.yellowText) }
     var resetFrame by rememberSaveable(project.id, project.style, initial.frame) { mutableStateOf(initial.frame == null && project.style.frame != null) }
     val style = project.style.copy(position = position, sizeFraction = size, background = background, outline = outline,
-        blurOriginal = blurOriginal, yellowText = yellowText, legacyDefault = false,
+        coverOriginal = coverOriginal, blurOriginal = blurOriginal, yellowText = yellowText, legacyDefault = false,
         frame = if (resetFrame) null else initial.frame)
     LaunchedEffect(style) { onPreview(style) }
     if(style.frame==null) {
@@ -824,8 +834,12 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     Slider(value = size, onValueChange = { size = it }, valueRange = .02f.. .09f,
         enabled = enabled, modifier = Modifier.semantics { contentDescription = "Cỡ chữ phụ đề" })
     Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(coverOriginal, { coverOriginal = it }, enabled = enabled)
+        Text("Che kín toàn bộ vùng chữ gốc")
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(blurOriginal, onCheckedChange = { blurOriginal = it; if (it) background = false }, enabled = enabled)
-        Text("Làm mờ gọn vùng phụ đề gốc")
+        Text("Làm mờ vùng phụ đề gốc")
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(yellowText, onCheckedChange = { yellowText = it; if (it) outline = true }, enabled = enabled)
@@ -833,7 +847,7 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(background, onCheckedChange = { background = it; if (it) blurOriginal = false }, enabled = enabled)
-        Text("Nền tối phía sau chữ Việt")
+        Text("Nền tối phía sau chữ dịch")
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(outline, onCheckedChange = { outline = it }, enabled = enabled)
@@ -842,7 +856,7 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(onClick = { val defaults = VideoSubtitleStyle(); position = defaults.position; size = defaults.sizeFraction;
             background = defaults.background; outline = defaults.outline; blurOriginal = defaults.blurOriginal;
-            yellowText = defaults.yellowText; resetFrame = true }, enabled = enabled) { Text("Đặt lại mặc định") }
+            coverOriginal = false; yellowText = defaults.yellowText; resetFrame = true }, enabled = enabled) { Text("Đặt lại mặc định") }
         Button(onClick = { onSave(style) }, enabled = enabled && style != project.style) { Text("Lưu cấu hình") }
     }
 }
@@ -1358,7 +1372,7 @@ private data class PreviewRenderCue(val startMs:Long,val endMs:Long,val text:Str
 
 @Composable
 private fun CueEditor(cue: VideoCue, allCues: List<VideoCue>, durationMs: Long, onDismiss: () -> Unit,
-    onSave: (VideoCue) -> Unit, onRetry: () -> Unit) {
+    onSave: (VideoCue) -> Unit, onRetry: () -> Unit, onJoin: () -> Unit) {
     var start by rememberSaveable(cue.id) { mutableStateOf(videoTime(cue.startMs)) }
     var end by rememberSaveable(cue.id) { mutableStateOf(videoTime(cue.endMs)) }
     var source by rememberSaveable(cue.id) { mutableStateOf(cue.source) }
@@ -1382,7 +1396,7 @@ private fun CueEditor(cue: VideoCue, allCues: List<VideoCue>, durationMs: Long, 
     }) {
             Text("${videoTime(cue.startMs)} → ${videoTime(cue.endMs)}", style = MaterialTheme.typography.labelMedium)
             OutlinedTextField(source, { if (it.length <= 2000) { source = it; markDraft() } }, label = { Text("Chữ Trung nguồn") }, minLines = 2)
-            OutlinedTextField(translation, { if (it.length <= 8000) { translation = it; markDraft() } }, label = { Text("Bản dịch Việt") }, minLines = 2)
+            OutlinedTextField(translation, { if (it.length <= 8000) { translation = it; markDraft() } }, label = { Text("Bản dịch") }, minLines = 2)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(approved, onCheckedChange = { approved = it })
                 Text("Tôi đã đối chiếu · Đã duyệt")
@@ -1392,6 +1406,11 @@ private fun CueEditor(cue: VideoCue, allCues: List<VideoCue>, durationMs: Long, 
                 OutlinedTextField(start, { start = it; markDraft() }, label = { Text("Bắt đầu · hh:mm:ss.mmm hoặc giây") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text))
                 OutlinedTextField(end, { end = it; markDraft() }, label = { Text("Kết thúc") })
+                val next = allCues.getOrNull(allCues.indexOfFirst { it.id == cue.id } + 1)
+                if (next != null) TextButton(onClick = onJoin,
+                    enabled = source == cue.source && translation == cue.translation && start == videoTime(cue.startMs) && end == videoTime(cue.endMs)) {
+                    Text("Nối với câu sau · " + next.source)
+                }
                 TextButton(onClick = onRetry) { Text("Dịch lại câu này bằng chế độ đã chọn") }
             }
             if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)

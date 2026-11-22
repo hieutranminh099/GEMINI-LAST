@@ -18,14 +18,15 @@ class SubtitleBackdropTest {
     private fun project() = VideoProject("fixture", "Fixture", "content://fixture/video", 1000, 1280, 720,
         sourceMode = VideoSourceMode.OCR, cues = listOf(cue))
 
-    @Test fun defaultIsTransparentOutlinedYellowAndBlurIsLimitedToOriginalCaptionHeight() {
+    @Test fun defaultIsTransparentOutlinedYellowAndBlurCoversTheEntireOriginalCaptionRegion() {
         val project = project()
         val plan = requireNotNull(subtitleBackdropPlan(project))
         assertFalse(project.style.background)
         assertTrue(project.style.outline)
         assertTrue(project.style.yellowText)
         assertTrue(project.style.blurOriginal)
-        assertEquals(.09f, plan.bottom - plan.top, .00001f)
+        assertEquals(project.roi[1], plan.top, .00001f)
+        assertEquals(project.roi[3], plan.bottom, .00001f)
         assertEquals(.84f, (plan.bottom + plan.top) / 2, .00001f)
         assertFalse(plan.activeAt(99_999))
         assertTrue(plan.activeAt(100_000))

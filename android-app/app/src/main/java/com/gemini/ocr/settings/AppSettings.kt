@@ -11,7 +11,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class AppSettings(context: Context) {
+class AppSettings(private val context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     var host: String
         get() = prefs.getString("host", "")!!
@@ -202,10 +202,18 @@ class AppSettings(context: Context) {
 
     var standaloneApiKey: String
         get() = decryptPref("standalone_api_key")
-        set(value) = encryptPref("standalone_api_key", value.trim())
+        set(value) = writeGeminiKey("standalone_api_key", value.trim())
 
     fun effectiveStandaloneApiKey(): String =
         standaloneApiKey.ifBlank { BuildConfig.GEMINI_API_KEY.trim() }
+
+    companion object {
+        private val credentialLock = Any()
+        val VIDEO_MODELS = listOf(com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite")
+    }
+    var videoTextModel: String
+        get() = prefs.getString("video_text_model", null)?.takeIf { it in VIDEO_MODELS } ?: VIDEO_MODELS.first()
+        set(value) { require(value in VIDEO_MODELS); prefs.edit().putString("video_text_model", value).apply() }
 
     var geminiKeyMode: GeminiKeyMode
         get() = GeminiKeyMode.fromPersisted(prefs.getString("gemini_video_key_mode", "") ?: "")
@@ -218,7 +226,7 @@ class AppSettings(context: Context) {
 
     fun setSecondaryGeminiApiKey(slot: Int, value: String) {
         require(slot in 2..3)
-        encryptPref("gemini_video_api_key_$slot", value.trim(), allowPlainFallback = false)
+        writeGeminiKey("gemini_video_api_key_$slot", value.trim())
     }
 
     fun geminiVideoKeys(): List<GeminiKeySlot> = listOf(
@@ -230,8 +238,65 @@ class AppSettings(context: Context) {
     fun hasGeminiVideoKey(): Boolean = if (geminiKeyMode == GeminiKeyMode.PRIMARY_ONLY)
         effectiveStandaloneApiKey().isNotBlank() else geminiVideoKeys().isNotEmpty()
 
+    private fun encryptedKey(value: String): String {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        return Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+    }
+
+    private fun writeGeminiKey(name: String, value: String) = synchronized(credentialLock) {
+        val edit = prefs.edit().remove("${name}_plain_fallback").putBoolean("gemini_keys_configured", true)
+        if (value.isEmpty()) edit.remove(name) else {
+            val encrypted = try { encryptedKey(value) } catch (_: java.security.GeneralSecurityException) {
+                error("Chưa lưu được khóa vào bộ nhớ bảo mật. Hãy thử lại trên thiết bị.")
+            }
+            edit.putString(name, encrypted)
+        }
+        check(edit.commit()) { "Không lưu được khóa Gemini vào bộ nhớ an toàn." }
+    }
+
+    internal fun backupGemini(password: CharArray): org.json.JSONObject {
+        val payload = synchronized(credentialLock) {
+            require(hasGeminiVideoKey()) { "Cấu hình khóa Gemini trước khi sao lưu." }
+            val tuning = com.gemini.ocr.video.VideoSmartBatchSettings(context)
+            org.json.JSONObject().put("keys", org.json.JSONArray(listOf(standaloneApiKey,
+                secondaryGeminiApiKey(2), secondaryGeminiApiKey(3))))
+                .put("model", videoTextModel).put("keyMode", geminiKeyMode.name)
+                .put("groupSize", tuning.groupSize).put("economy", tuning.economyMode)
+        }.toString().toByteArray(Charsets.UTF_8)
+        return try { GeminiRecovery.seal(payload, password) } finally { payload.fill(0) }
+    }
+
+    internal fun restoreGemini(envelope: org.json.JSONObject, password: CharArray) {
+        val bytes = GeminiRecovery.open(envelope, password)
+        val config = try { org.json.JSONObject(String(bytes, Charsets.UTF_8)) } finally { bytes.fill(0) }
+        val keys = config.getJSONArray("keys")
+        require(keys.length() == 3)
+        val values = List(3) { i -> (keys.get(i) as String).also { require(it.length <= 4096) } }
+        val model = config.getString("model").also { require(it in VIDEO_MODELS) }
+        val mode = GeminiKeyMode.valueOf(config.getString("keyMode"))
+        require(if (mode == GeminiKeyMode.PRIMARY_ONLY) values.first().isNotBlank() else values.any { it.isNotBlank() })
+        val size = config.getInt("groupSize").also { require(it in com.gemini.ocr.video.VideoSmartBatchSettings.GROUP_SIZES) }
+        val economy = config.getBoolean("economy")
+        synchronized(credentialLock) {
+            val current = listOf(standaloneApiKey, secondaryGeminiApiKey(2), secondaryGeminiApiKey(3))
+            require(current == values || (!prefs.getBoolean("gemini_keys_configured", false) && current.all { it.isEmpty() })) {
+                "Thiết bị này đã đổi hoặc xóa khóa. Bản sao không được ghi đè cấu hình khóa hiện tại."
+            }
+            val edit = prefs.edit().putString("video_text_model", model).putString("gemini_video_key_mode", mode.name)
+                .putBoolean("gemini_keys_configured", true)
+            val names = listOf("standalone_api_key", "gemini_video_api_key_2", "gemini_video_api_key_3")
+            for ((i, name) in names.withIndex()) {
+                edit.remove("${name}_plain_fallback")
+                if (values[i].isEmpty()) edit.remove(name) else edit.putString(name, encryptedKey(values[i]))
+            }
+            check(edit.commit()) { "Chưa lưu được cấu hình vào bộ nhớ bảo mật." }
+            com.gemini.ocr.video.VideoSmartBatchSettings(context).apply { groupSize = size; economyMode = economy }
+        }
+    }
+
     private fun decryptPref(prefKey: String): String {
-        val stored = prefs.getString(prefKey, null) ?: return ""
+        val stored = prefs.getString(prefKey, null) ?: return prefs.getString("${prefKey}_plain_fallback", "").orEmpty()
         return try {
             val bytes = Base64.decode(stored, Base64.NO_WRAP)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")

@@ -125,12 +125,13 @@ class VideoStore(context: Context) {
             check(pending.renameTo(output)){"Không thể lưu bản sao nguồn."};return Uri.fromFile(output)
         } catch(e:Throwable){pending.delete();throw e}
     }
-    fun exportFile(id:String,extension:String):File {
+    fun exportFile(id:String,extension:String,language:String="vi"):File {
+        require(language in setOf("vi","en"))
         require(extension in setOf("srt","ass","mp4","partial.mp4"))
-        return File(folder(id),"translated.$extension")
+        return File(folder(id),if(language=="en") "translated-en.$extension" else "translated.$extension")
     }
     internal fun writeSubtitle(id: String, name: String, text: String) {
-        require(name in setOf("source.zh.srt", "translated.srt", "translated.ass"))
+        require(name in setOf("source.zh.srt", "translated.srt", "translated.ass", "translated-en.srt", "translated-en.ass"))
         val destination = File(folder(id), name)
         val temporary = File.createTempFile("subtitle-", ".partial", destination.parentFile)
         try {

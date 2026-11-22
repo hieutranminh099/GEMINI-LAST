@@ -125,9 +125,15 @@ class VideoJobs internal constructor(
         }
         val retained=store.retainSubtitle(id,uri)
         store.save(old.copy(sourceMode=VideoSourceMode.SIDECAR,subtitleUri=retained.toString(),originalSubtitleUri=uri.toString(),
-            subtitleName=name,cues=emptyList(),scanMs=0,carry=org.json.JSONObject(),speech=org.json.JSONObject(),stage=VideoStage.READY,
+            subtitleName=name,otherCues=emptyList(),cues=emptyList(),scanMs=0,carry=org.json.JSONObject(),speech=org.json.JSONObject(),stage=VideoStage.READY,
             resumeStage=VideoStage.EXTRACTING,pipeline=VideoPipelineCheckpoint(contextProfile=old.pipeline.contextProfile,contextRevision=old.pipeline.contextRevision,sharedRoiRevision=old.pipeline.sharedRoiRevision),exportedMp4="",progress=0,message="Đã chọn phụ đề mới. Bấm Bắt đầu để xử lý."));refresh()
     }}
+    suspend fun selectTarget(id: String, language: String) = withContext(Dispatchers.IO) { edits.withLock {
+        requireNoBatch()
+        check(busy.value == null) { "Tạm dừng tác vụ trước khi đổi ngôn ngữ." }
+        check(!File(store.folder(id), "batch-owner").exists()) { "Chọn ngôn ngữ trong dự án video riêng." }
+        store.save(store.load(id).selectTarget(language)).also { refresh(); queueSync(it) }
+    } }
     suspend fun save(project:VideoProject):VideoProject=withContext(Dispatchers.IO){ edits.withLock {
         requireNoBatch()
         check(busy.value!=project.id){"Tạm dừng tác vụ trước khi chỉnh sửa."}
@@ -135,6 +141,8 @@ class VideoJobs internal constructor(
         require(project.visualSampleMs in setOf(250L,500L))
         require(old.visualSampleMs==project.visualSampleMs || (old.cues.isEmpty() && old.scanMs==0L)){
             "Tạo bản quét mới trước khi đổi tốc độ lấy mẫu để giữ timeline và câu đã duyệt."}
+        require(project.targetLanguage == old.targetLanguage)
+        require(old.targetLanguage != "en" || project.translationMode == VideoTranslationMode.GEMINI)
         val extractionChanged=old.sourceMode!=project.sourceMode || old.subtitleUri!=project.subtitleUri || old.trackId!=project.trackId || old.roi!=project.roi
         require(!extractionChanged || (project.updatedAt==old.updatedAt && project.cues==old.cues && project.scanMs==old.scanMs)) {
             "Dự án đã thay đổi; mở lại cấu hình trước khi thay nguồn hoặc vùng OCR. Nội dung mới vẫn được giữ."
@@ -154,17 +162,24 @@ class VideoJobs internal constructor(
         // Configuration edits must preserve the latest persisted timeline and checkpoint.
         val configured=old.copy(sourceMode=project.sourceMode,translationMode=project.translationMode,
             subtitleUri=project.subtitleUri,subtitleName=project.subtitleName,trackId=project.trackId,
-            roi=project.roi,style=project.style,glossary=project.glossary,profile=project.profile,
+            roi=project.roi,style=project.style,glossary=project.glossary,profile=project.profile,dialogueContext=project.dialogueContext,
             visualSampleMs=project.visualSampleMs).withOfflinePolishPolicy(project.offlinePolishPolicy)
         val retained=if(project.subtitleUri.isNotBlank() && project.subtitleUri!=old.subtitleUri)
             configured.copy(subtitleUri=store.retainSubtitle(project.id,Uri.parse(project.subtitleUri)).toString(),originalSubtitleUri=project.subtitleUri) else configured
         val next=when {
-            extractionChanged->retained.copy(pipeline=VideoPipelineCheckpoint(contextProfile=old.pipeline.contextProfile,contextRevision=old.pipeline.contextRevision,sharedRoiRevision=old.pipeline.sharedRoiRevision),cues=emptyList(),scanMs=0,carry=org.json.JSONObject(),speech=org.json.JSONObject(),ocrMetrics=org.json.JSONObject(),stage=VideoStage.READY,resumeStage=VideoStage.EXTRACTING,exportedMp4="",progress=0)
+            extractionChanged->retained.copy(otherCues=emptyList(),pipeline=VideoPipelineCheckpoint(contextProfile=old.pipeline.contextProfile,contextRevision=old.pipeline.contextRevision,sharedRoiRevision=old.pipeline.sharedRoiRevision),cues=emptyList(),scanMs=0,carry=org.json.JSONObject(),speech=org.json.JSONObject(),ocrMetrics=org.json.JSONObject(),stage=VideoStage.READY,resumeStage=VideoStage.EXTRACTING,exportedMp4="",progress=0)
             translationChanged->retained.copy(pipeline=retained.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),cues=retained.cues.map{if(it.protectedText)it else it.copy(translation="",model="",error="",localDraft="",refinementState="",draftVi="",polishedVi="")},stage=VideoStage.PAUSED,
                 resumeStage=if(extractionPending)VideoStage.EXTRACTING else VideoStage.TRANSLATING,exportedMp4="")
             else->retained.copy(exportedMp4=if(old.style!=project.style)"" else retained.exportedMp4)
         }
         store.save(next).also{refresh();queueSync(it)}
+    } }
+    suspend fun joinNext(id: String, cueId: String, expectedAt: Long) = withContext(Dispatchers.IO) { edits.withLock {
+        requireNoBatch()
+        check(busy.value == null)
+        val project = store.load(id)
+        check(project.updatedAt == expectedAt && !project.sourceExtractionPending) { "Mở lại timeline sau khi lấy đủ nguồn." }
+        store.save(project.joinNext(cueId)).also { refresh(); queueSync(it) }
     } }
     suspend fun updateCue(id:String,cue:VideoCue)=withContext(Dispatchers.IO){ edits.withLock {
         requireNoBatch()
@@ -191,7 +206,22 @@ class VideoJobs internal constructor(
         edits.withLock {
         requireNoBatch()
         check(busy.value==null){"Tạm dừng tác vụ hiện tại."};val p=store.load(id)
-        require(p.cues.any{it.id==cueId})
+        val index = p.cues.indexOfFirst { it.id == cueId }
+        require(index >= 0)
+        if (p.translationMode != VideoTranslationMode.OFFLINE) {
+            val settings = AppSettings(context)
+            val batch = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(p.cues, index), p.dialogueContext).copy(targetLanguage = p.targetLanguage,
+                requestModel = settings.videoTextModel, strictDialogue = true)
+            val result = VideoTranslationClient(context).translate(settings.effectiveStandaloneApiKey(),
+                batch, p.profile, p.glossary) { check(busy.value == null) }
+            val next = p.cues.toMutableList()
+            next[index] = next[index].copy(translation = result.accepted.getValue(cueId), approved = false,
+                model = result.model, error = "", draftVi = "", polishedVi = "", refinementState = "done")
+            check(busy.value == null && store.load(id).updatedAt == p.updatedAt) { "Dự án đã thay đổi. Mở lại câu trước khi thử lại." }
+            store.save(p.copy(cues = next, exportedMp4 = "", stage = VideoStage.REVIEW,
+                pipeline = p.pipeline.invalidateFrom(BatchPipelineStage.POLISH))).also { refresh(); queueSync(it) }
+            return@withContext
+        }
         store.save(p.copy(pipeline=p.pipeline.invalidateFrom(BatchPipelineStage.TRANSLATE),cues=p.cues.map{if(it.id==cueId)it.copy(translation="",approved=false,model="",error="",localDraft="",refinementState="",draftVi="",polishedVi="") else it},stage=VideoStage.PAUSED,
             resumeStage=if(p.sourceExtractionPending)VideoStage.EXTRACTING else VideoStage.TRANSLATING,exportedMp4=""));refresh()
         };start(id)
@@ -535,8 +565,8 @@ class VideoJobs internal constructor(
                     if(pipelineStage==BatchPipelineStage.FINISH){
                         require(p.cues.all{VideoTranslationPlan.isComplete(it,p.translationMode==VideoTranslationMode.HYBRID)}){"Còn câu chưa dịch; chưa đánh dấu hoàn tất."}
                         VideoTimeline.validate(p.cues,p.durationMs)
-                        store.writeSubtitle(id, "translated.srt", VideoTimeline.srt(p.cues, p.durationMs))
-                        store.writeSubtitle(id, "translated.ass", VideoTimeline.ass(p))
+                        store.writeSubtitle(id, if (p.targetLanguage == "en") "translated-en.srt" else "translated.srt", VideoTimeline.srt(p.cues, p.durationMs))
+                        store.writeSubtitle(id, if (p.targetLanguage == "en") "translated-en.ass" else "translated.ass", VideoTimeline.ass(p))
                         persist(p.copy(stage=VideoStage.REVIEW,progress=100,pipeline=p.pipeline.record(pipelineStage,"COMPLETE",p.cues.size.toLong()),
                             message="Đã lưu phụ đề. Kiểm tra các câu được đánh dấu rồi xác nhận xuất hoặc lưu Kho phim."))
                         return@launch
@@ -546,14 +576,14 @@ class VideoJobs internal constructor(
                     require(!p.sourceExtractionPending){"Chưa nhận hết phụ đề nguồn. Bấm Tiếp tục xử lý trước khi xuất."}
                     require(p.cues.isNotEmpty() && p.cues.all{it.translation.isNotBlank()}){"Dịch hoặc sửa xong các câu trước khi xuất MP4."}
                     VideoTimeline.validate(p.cues,p.durationMs);gate();persist(p.copy(stage=intended,progress=0,message="Đang xuất MP4 có phụ đề…"))
-                    val output=store.exportFile(id,"partial.mp4")
+                    val output=store.exportFile(id,"partial.mp4",p.targetLanguage)
                     if(output.exists())check(output.delete()) { "Không thể dọn bản xuất tạm của dự án." }
                     while(true){
                         gate()
                         try {VideoExporter.export(context,p,output,::gate){fraction->persist(p.copy(stage=VideoStage.EXPORTING,progress=(fraction*100).toInt(),message="Đang xuất MP4…"))};break}
                         catch(_:VideoExporter.LivePreemptedException){gate();persist(p.copy(progress=0,message="Tiếp tục xuất MP4 từ đầu giai đoạn sau Live."))}
                     }
-                    val final=store.exportFile(id,"mp4")
+                    val final=store.exportFile(id,"mp4",p.targetLanguage)
                     // The only replacement is this project's generated output; source URI is untouched.
                     publishVideoArtifact(output, final)
                     persist(p.copy(stage=VideoStage.COMPLETE,progress=100,exportedMp4=final.absolutePath,message="Đã tạo MP4. Bấm Lưu MP4 để chọn thư mục."))
@@ -745,7 +775,7 @@ class VideoJobs internal constructor(
                         var firstCloudCandidate = 0
                         if(p.translationMode!=VideoTranslationMode.OFFLINE)while(true){
                             gate();val repairing=pendingRepair!=null
-                            val selectedBatch=if(hybrid)VideoFullDialoguePlan.next(p.cues,p.durationMs,p.pipeline.contextProfile,hybridTargetLimit){candidate->
+                            val selectedBatch=if(hybrid)VideoFullDialoguePlan.next(p.cues,p.durationMs,p.dialogueContext.ifBlank { p.pipeline.contextProfile },hybridTargetLimit){candidate->
                                 runCatching{VideoTranslationClient.buildRequest(candidate,p.profile,p.glossary)}.isSuccess
                             }?:break
                                 else pendingRepair ?: VideoTranslationPlan.nextProjectedCloudBatch(
@@ -753,10 +783,18 @@ class VideoJobs internal constructor(
                                     startIndex = firstCloudCandidate
                                 ) { _, cue -> if (cue.id in failedCloudIds) cue.copy(approved = true) else cue }
                                     ?.also { firstCloudCandidate = it.indices.first() } ?: break
-                            val contextualBatch=if(pipelineStage!=null && !hybrid)VideoStagedPipeline.withContext(selectedBatch,p.pipeline.contextProfile)else selectedBatch
-                            val batch=if(adaptiveGroup!=null)VideoTranslationClient.withCompactTargets(contextualBatch)else contextualBatch
+                            val contextualBatch = if (pipelineStage == null && p.dialogueContext.isNotBlank())
+                                VideoStagedPipeline.withContext(selectedBatch, p.dialogueContext)
+                            else if (pipelineStage != null && !hybrid) VideoStagedPipeline.withContext(selectedBatch,p.pipeline.contextProfile)
+                            else selectedBatch
+                            val batch = when {
+                                adaptiveGroup != null -> VideoTranslationClient.withCompactTargets(contextualBatch)
+                                pipelineStage == null -> contextualBatch.copy(targetLanguage = p.targetLanguage,
+                                    requestModel = AppSettings(context).videoTextModel, strictDialogue = true)
+                                else -> contextualBatch
+                            }
                             pendingRepair=null
-                            val reviewed=if(repairing)null else batchReviewedMemory.lookup(p,contextualBatch)
+                            val reviewed=if(repairing || batch.strictDialogue)null else batchReviewedMemory.lookup(p,contextualBatch)
                             if(reviewed!=null){
                                 val selected=VideoTranslationPlan.selectBatch(batch,reviewed.positions)
                                 val updated=VideoTranslationPlan.applyCloudResult(p.cues,selected,reviewed.translations,reviewed.scope.modelVersion,hybrid,p.glossary)
@@ -765,7 +803,7 @@ class VideoJobs internal constructor(
                                 continue
                             }
                             val cacheAt=System.nanoTime()
-                            val cached=if(repairing)null else batchCache.lookup(p,batch)
+                            val cached=if(repairing || batch.strictDialogue)null else batchCache.lookup(p,batch)
                             if(!repairing)runCatching{smartMetrics.add("cache_lookups");smartMetrics.add("cache_lookup_wall_ms",(System.nanoTime()-cacheAt)/1_000_000L)}
                             if(cached!=null){
                                 runCatching{smartMetrics.add("cache_${cached.level.name.lowercase()}_hits");smartMetrics.flush()}
@@ -817,7 +855,7 @@ class VideoJobs internal constructor(
                                     } else p.pipeline
                                     persist(p.copy(cues=updated,model=outcome.model,pipeline=recoveredPipeline,
                                         progress=unstagedTranslationPercent(updated, hybrid)))
-                                    if(!repairing)runCatching{batchCache.save(p,batch,accepted,outcome.model)}
+                                    if(!repairing && !batch.strictDialogue)runCatching{batchCache.save(p,batch,accepted,outcome.model)}
                                     if(!repairing)adaptiveGroup?.complete(batch.cueIds.size)
                                     economy?.acknowledge()
                                 } else {
@@ -921,8 +959,8 @@ class VideoJobs internal constructor(
                             message="Đã lưu bản dịch nháp theo từng nhóm. Tiếp theo kiểm tra và hiệu đính."))
                         return@launch
                     }
-                    store.writeSubtitle(id, "translated.srt", VideoTimeline.srt(p.cues, p.durationMs))
-                    store.writeSubtitle(id, "translated.ass", VideoTimeline.ass(p))
+                    store.writeSubtitle(id, if (p.targetLanguage == "en") "translated-en.srt" else "translated.srt", VideoTimeline.srt(p.cues, p.durationMs))
+                    store.writeSubtitle(id, if (p.targetLanguage == "en") "translated-en.ass" else "translated.ass", VideoTimeline.ass(p))
                     persist(p.copy(stage=VideoStage.REVIEW,progress=100,message=when(p.translationMode){
                         VideoTranslationMode.OFFLINE->"Đã dịch offline ${p.cues.size} câu dưới dạng Draft. Kiểm tra chữ Trung, tên, xưng hô và phủ định trước khi tải xuống."
                         VideoTranslationMode.GEMINI->"Gemini đã dịch ${p.cues.size} câu theo ngữ cảnh. Bản dịch vẫn là Draft; kiểm tra chữ Trung nguồn trước khi tải xuống."

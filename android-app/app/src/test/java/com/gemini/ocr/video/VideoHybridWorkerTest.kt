@@ -99,7 +99,7 @@ class VideoHybridWorkerTest {
         assertTrue(result.cues.all{it.source=="你好" && it.translation.isBlank()})
         assertTrue(File(store.folder(p.id),"source.zh.srt").isFile)
     }
-    @Test fun partialReplyStopsAfterOneRequestAndExplicitResumeTargetsOnlyMissingIdsWithAllContext()=runBlocking {
+    @Test fun partialInteractiveReplyKeepsPriorTimelineAndResumeRetriesWholePendingGroup()=runBlocking {
         key();val p=full(4);val approved=p.cues.first().copy(translation="Bản đã duyệt",approved=true)
         val saved=store.save(p.copy(cues=listOf(approved)+p.cues.drop(1)))
         val requests=mutableListOf<List<String>>()
@@ -109,22 +109,22 @@ class VideoHybridWorkerTest {
         }
         val failed=run(saved)
         assertEquals(1,requests.size);assertEquals(VideoStage.FAILED,failed.stage)
-        assertEquals(approved,failed.cues.first());assertEquals("done",failed.cues[1].refinementState)
+        assertEquals(approved,failed.cues.first());assertTrue(failed.cues.drop(1).all { it.translation.isBlank() })
         assertEquals("pending",failed.cues.last().refinementState)
         val result=run(failed)
-        assertEquals(2,requests.size);assertEquals(listOf(p.cues.last().id),requests.last())
+        assertEquals(2,requests.size);assertEquals(requests.first(),requests.last())
         assertEquals(approved,result.cues.first());assertEquals(VideoStage.REVIEW,result.stage)
         assertEquals(p.cues.map{Triple(it.id,it.startMs,it.endMs)},result.cues.map{Triple(it.id,it.startMs,it.endMs)})
     }
-    @Test fun tokenLimitedShuffledReplyKeepsTheLastReturnedIdPendingInsteadOfReportingSuccess()=runBlocking {
+    @Test fun tokenLimitedShuffledInteractiveReplyKeepsAllTargetsPending()=runBlocking {
         key();val p=full(4);var calls=0
         VideoTranslationClient.overrideResponseForTest={batch->calls++;body(batch.cueIds.reversed(),"MAX_TOKENS")}
         val result=run(p)
         assertEquals(1,calls);assertEquals(VideoStage.FAILED,result.stage)
-        assertEquals(3,result.cues.count{VideoTranslationPlan.isComplete(it,true)})
+        assertEquals(0,result.cues.count{VideoTranslationPlan.isComplete(it,true)})
         assertEquals("pending",result.cues.first().refinementState)
-        assertEquals("done",result.cues.last().refinementState)
-        assertTrue(result.message.contains("TEXT_TRUNCATED"));assertEquals(p.durationMs,result.scanMs)
+        assertEquals("pending",result.cues.last().refinementState)
+        assertTrue(result.message.contains("TEXT_INVALID_RESPONSE"));assertEquals(p.durationMs,result.scanMs)
     }
     @Test fun ambiguousDuplicateIdsCannotOverwriteAnySavedCueOrTriggerAutomaticRepair()=runBlocking {
         key();val p=full(3);var calls=0

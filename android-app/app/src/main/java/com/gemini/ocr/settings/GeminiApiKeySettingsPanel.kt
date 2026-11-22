@@ -9,10 +9,32 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.gemini.ocr.ui.ExpandableSection
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import androidx.compose.ui.platform.LocalContext
+import com.gemini.ocr.video.VideoChoiceRow
+import com.gemini.ocr.video.VideoTranslationClient
 
 @Composable
 fun GeminiApiKeySettingsPanel(settings: AppSettings, enabled: Boolean, onChanged: () -> Unit = {}) {
     var mode by remember { mutableStateOf(settings.geminiKeyMode) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var model by remember { mutableStateOf(settings.videoTextModel) }
+    var checking by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+    VideoChoiceRow("Model dịch lời thoại video", model, AppSettings.VIDEO_MODELS.map { it to it },
+        enabled && !checking, { model = it; settings.videoTextModel = it; status = "" }, "video_text_model")
+    OutlinedButton(enabled = enabled && !checking && settings.hasGeminiVideoKey(), onClick = {
+        checking = true
+        scope.launch {
+            try { VideoTranslationClient(context).checkModel(); status = "Model hỗ trợ tạo nội dung với cấu hình đã chọn." }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { status = e.message ?: "Chưa kết nối được Gemini." }
+            finally { checking = false }
+        }
+    }) { Text("Kiểm tra kết nối Gemini") }
+    if (status.isNotBlank()) Text(status)
     ExpandableSection("3 khóa Gemini cho video", "Dịch video và dịch hàng loạt") {
         Text("Khóa chính ở trên cũng dùng cho dịch trực tiếp. Bạn có thể thêm hai khóa để phân phối các lượt dịch video.",
             style = MaterialTheme.typography.bodySmall)

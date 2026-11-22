@@ -15,7 +15,7 @@ import androidx.media3.effect.GlShaderProgram
 
 /** Immutable, bounded render input; contains no video pixels and never calls OCR or an API. */
 internal data class SubtitleBackdropPlan(val left: Float, val top: Float, val right: Float, val bottom: Float,
-    val intervals: List<Pair<Long, Long>>) {
+    val intervals: List<Pair<Long, Long>>, val opaque: Boolean = false) {
     fun activeAt(timeUs: Long, playbackStartMs: Long = 0): Boolean {
         // Media3 playback timestamps are relative to the prepared position, including negative
         // timestamps when seeking behind it. Transformer timestamps already use the source clock.
@@ -39,19 +39,16 @@ internal data class SubtitleBackdropPlan(val left: Float, val top: Float, val ri
 
 internal fun subtitleBackdropPlan(project: VideoProject): SubtitleBackdropPlan? {
     val style = project.style.displayStyle()
-    if (!style.blurOriginal || style.background || project.sourceMode == VideoSourceMode.ASR) return null
+    if (!style.coverOriginal && (!style.blurOriginal || style.background || project.sourceMode == VideoSourceMode.ASR)) return null
     val roi = project.roi
     if (roi.size != 4 || roi.any { !it.isFinite() || it !in 0f..1f } || roi[2] <= roi[0] || roi[3] <= roi[1]) return null
+    if (style.coverOriginal) return SubtitleBackdropPlan(roi[0], roi[1], roi[2], roi[3],
+        listOf(0L to project.durationMs), opaque = true)
     val rows = VideoTimeline.validate(project.cues, project.durationMs).filter {
         it.translation.isNotBlank() && !it.origin.startsWith("ASR")
     }
     if (rows.isEmpty()) return null
-    // A broad OCR search area is not a request to obscure the lower quarter of the picture.
-    // Narrow user-selected regions are kept exact; broad ones cover only a caption-height strip.
-    val height = minOf(roi[3] - roi[1], .09f)
-    val center = (roi[1] + roi[3]) / 2f
-    val top = (center - height / 2f).coerceIn(0f, 1f - height)
-    return SubtitleBackdropPlan(roi[0], top, roi[2], top + height,
+    return SubtitleBackdropPlan(roi[0], roi[1], roi[2], roi[3],
         rows.map { it.startMs to it.endMs })
 }
 
@@ -72,6 +69,7 @@ internal class SubtitleBackdropShaderProgram(private val plan: SubtitleBackdropP
         try {
             program = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
             program.setBufferAttribute("aPosition", GlUtil.getNormalizedCoordinateBounds(), 4)
+            program.setFloatUniform("uOpaque", if (plan.opaque) 1f else 0f)
             program.setFloatsUniform("uRegion", floatArrayOf(plan.left, plan.top, plan.right, plan.bottom))
         } catch (e: GlUtil.GlException) {
             throw VideoFrameProcessingException(e)
@@ -122,6 +120,7 @@ internal class SubtitleBackdropShaderProgram(private val plan: SubtitleBackdropP
             uniform vec2 uStep;
             uniform vec2 uFeather;
             uniform float uActive;
+            uniform float uOpaque;
             varying vec2 vUv;
             float weight(int n) {
                 if (n == 0) return 6.0;
@@ -136,6 +135,7 @@ internal class SubtitleBackdropShaderProgram(private val plan: SubtitleBackdropP
                     gl_FragColor = original;
                     return;
                 }
+                if (uOpaque > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
                 vec4 blurred = vec4(0.0);
                 for (int y = -2; y <= 2; y++) {
                     for (int x = -2; x <= 2; x++) {

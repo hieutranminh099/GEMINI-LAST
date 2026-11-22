@@ -19,6 +19,20 @@ import java.util.concurrent.TimeUnit
 
 /** Official video text requests use IDs, while Live keeps its existing response contract. */
 internal class VideoTranslationClient(private val context: Context? = null) {
+    suspend fun checkModel() = withContext(Dispatchers.IO) {
+        val app = requireNotNull(context)
+        val settings = AppSettings(app)
+        require(settings.hasGeminiVideoKey()) { "Nhập khóa Gemini trong Tùy chỉnh." }
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/${settings.videoTextModel}"
+        val body = VideoGeminiAccounts.request(app, settings.effectiveStandaloneApiKey(), {}, { _, _, _ -> }) { key ->
+            VideoApiRecovery.exchange(requestClient(false), Request.Builder().url(url).header("x-goog-api-key", key).build())
+        }
+        val methods = JSONObject(body).getJSONArray("supportedGenerationMethods")
+        require((0 until methods.length()).any { methods.getString(it) == "generateContent" }) {
+            "Model chưa hỗ trợ dịch lời thoại. Chọn model khác."
+        }
+    }
+
     data class Result(val accepted: Map<String, String>, val missingIds: List<String>, val model: String,
         val elapsedMs: Long, val quotaWaitMs: Long = 0, val tokens: GeminiGenerationMetrics? = null,
         val needsReviewIds: Set<String> = emptySet(), val truncated: Boolean = false)
@@ -27,12 +41,13 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                           onRetry: suspend (Int, Long, String) -> Unit = { _, _, _ -> },
                           beforeDispatch: suspend () -> Unit): Result = withContext(Dispatchers.IO) {
         require(batch.cueIds.distinct().size == batch.cueIds.size && batch.cueIds.size == batch.texts.size)
+        require(batch.requestModel in AppSettings.VIDEO_MODELS)
         val fullPayload=if(batch.fullDialogue)buildRequest(batch,profile,glossary) else null
         val started = System.nanoTime()
         overrideResponseForTest?.let { override ->
             check(com.gemini.ocr.BuildConfig.DEBUG)
             beforeDispatch()
-            return@withContext parseResponse(override(batch), batch, glossary, StandaloneTranslator.FAST_MODEL,
+            return@withContext parseResponse(override(batch), batch, glossary, batch.requestModel,
                 (System.nanoTime() - started) / 1_000_000L)
         }
         // Keep the established offline/mock verification seam; it does not spend API quota.
@@ -42,6 +57,7 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                 profile = profile, glossaryRaw = glossary, saveToSelfLearningBank = false, deferSideEffects = true,
                 cacheNamespace = "video-private", contextItems = emptyList(), applyLegacyOcrCorrection = false,
                 videoTranslationContext = batch.videoContext, videoMaxOutputTokens = batch.maxOutputTokens)
+            require(outcome.translations.size == batch.cueIds.size && outcome.translations.all { it.isNotBlank() })
             return@withContext Result(batch.cueIds.zip(outcome.translations).toMap(), emptyList(), outcome.modelUsed,
                 outcome.elapsedMs, outcome.quotaWaitMs, outcome.generationMetrics)
         }
@@ -50,14 +66,14 @@ internal class VideoTranslationClient(private val context: Context? = null) {
         val payload = fullPayload ?: buildRequest(batch, profile, glossary)
         val operation: suspend (String) -> String = { selectedKey ->
             StandaloneTranslator.beforeNetworkCallForTest?.invoke()
-            val request = Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/models/${StandaloneTranslator.FAST_MODEL}:generateContent")
+            val request = Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/models/${batch.requestModel}:generateContent")
                 .header("x-goog-api-key", selectedKey)
                 .post(singleAttemptBody(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))).build()
             VideoApiRecovery.exchange(requestClient(batch.fullDialogue), request)
         }
         val body = if (context == null) VideoApiRecovery.run(beforeDispatch, onRetry = onRetry) { operation(apiKey) }
             else VideoGeminiAccounts.request(context, apiKey, beforeDispatch, onRetry, operation)
-        parseResponse(body, batch, glossary, StandaloneTranslator.FAST_MODEL, (System.nanoTime() - started) / 1_000_000L)
+        parseResponse(body, batch, glossary, batch.requestModel, (System.nanoTime() - started) / 1_000_000L)
     }
 
     companion object {
@@ -75,6 +91,7 @@ internal class VideoTranslationClient(private val context: Context? = null) {
         internal fun buildRequest(batch: VideoTranslationPlan.Batch, profile: String, glossary: String): String {
             require(batch.cueIds.size == batch.texts.size && batch.cueIds.distinct().size == batch.cueIds.size)
             if(batch.fullDialogue)return fullDialogueRequest(batch,profile,glossary)
+            if (batch.strictDialogue) return dialogueWindowRequest(batch, profile, glossary)
             val context = JSONObject(batch.videoContext)
             val targets = context.getJSONArray("targets")
             require(targets.length() == batch.cueIds.size)
@@ -99,6 +116,33 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             return request.toString()
         }
 
+        private fun dialogueWindowRequest(batch: VideoTranslationPlan.Batch, profile: String, glossary: String): String {
+            val window = JSONObject(batch.videoContext)
+            val targets = window.getJSONArray("targets")
+            require(targets.length() == batch.indices.size)
+            val rows = mutableListOf<JSONObject>()
+            for (section in listOf("previous", "inside", "targets", "following")) {
+                val items = window.getJSONArray(section)
+                for (i in 0 until items.length()) {
+                    val row = items.getJSONObject(i)
+                    if (section == "targets") {
+                        require(row.getInt("index") == batch.indices[i] && row.getString("source") == batch.texts[i])
+                        row.put("id", batch.cueIds[i])
+                    } else {
+                        row.put("id", "context-" + row.getInt("index"))
+                        // A source ID may itself begin with "context-".
+                        while (row.getString("id") in batch.cueIds) row.put("id", "_" + row.getString("id"))
+                    }
+                    rows += row
+                }
+            }
+            val dialogue = JSONObject().put("dialogue", JSONArray(rows.sortedBy { it.getInt("index") }))
+                .put("contextScope", "window").put("targetIds", JSONArray(batch.cueIds))
+                .put("filmContext", window.optString("filmContext"))
+            return fullDialogueRequest(batch.copy(fullDialogue = true, videoContext = dialogue.toString(),
+                maxOutputTokens = maxOf(8192, batch.maxOutputTokens)), profile, glossary)
+        }
+
         private fun fullDialogueRequest(batch:VideoTranslationPlan.Batch,profile:String,glossary:String):String {
             require(batch.indices.isNotEmpty() && batch.indices.size==batch.cueIds.size &&
                 batch.indices.distinct().size==batch.indices.size && batch.indices.sorted()==batch.indices)
@@ -120,11 +164,18 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             // Reuse model settings, with one video-only instruction contract. Live and legacy
             // batches retain their own prompts; source occurs only in dialogue.
             val request=JSONObject(StandaloneTranslator.buildGeminiRequestJson(listOf("video"),profile=profile,
-                structuredOutput=true,videoTranslationContext="{}",videoMaxOutputTokens=8192))
+                requestModel=batch.requestModel,structuredOutput=true,videoTranslationContext="{}",videoMaxOutputTokens=8192))
             request.put("systemInstruction",JSONObject().put("parts",JSONArray().put(
-                JSONObject().put("text",VideoDialoguePrompt.system(profile)))))
+                JSONObject().put("text",VideoDialoguePrompt.system(profile,batch.targetLanguage)))))
             val terms=PhoneTranslationCache.parseGlossary(glossary)
             context.put("promptRevision",VideoDialoguePrompt.REVISION).put("profile",profile).put("glossary",JSONObject(terms))
+            context.put("targetLanguage", batch.targetLanguage)
+            if (batch.targetLanguage == "en") {
+                for (i in 0 until dialogue.length()) {
+                    val row = dialogue.getJSONObject(i)
+                    row.remove("vietnamese")?.let { row.put("previousEnglish", it) }
+                }
+            }
             val userPart=JSONObject().put("text","Phần hội thoại, ngữ cảnh và các ID cần dịch (JSON dữ liệu):\n"+context.toString())
             val user=JSONObject().put("role","user").put("parts",JSONArray().put(userPart))
             request.put("contents",JSONArray().put(user))
@@ -190,9 +241,10 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                     val text = rawTranslation.trim()
                     if (text.isBlank() || text.length > 8000) continue
                     val source = sources.getValue(id)
+                    if (batch.strictDialogue) require(batch.cueIds[index] == id)
                     val processed = runCatching {
                         TranslationOutputGuard.validateModelOutput("zh", listOf(source), listOf(text), terms)
-                        StandaloneTranslator.applyGlossaryPostProcess(listOf(source), listOf(text), glossary, enrichWithBank = false).single()
+                        if (batch.targetLanguage == "en") text else StandaloneTranslator.applyGlossaryPostProcess(listOf(source), listOf(text), glossary, enrichWithBank = false).single()
                     }.getOrNull() ?: continue
                     accepted[id] = processed
                 }
@@ -201,6 +253,8 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                 // pending when every requested ID appeared, rather than guess the target ID.
                 if(truncated && accepted.size==batch.cueIds.size && rows.length()>0)
                     accepted.remove(rows.getJSONObject(rows.length()-1).getString("id"))
+                if (batch.strictDialogue && (accepted.size != batch.cueIds.size || candidate.optString("finishReason") == "MAX_TOKENS"))
+                    throw VideoApiException("TEXT_INCOMPLETE_RESPONSE", detail = "Gemini trả thiếu hoặc cắt câu. Kiểm tra nguồn và bấm thử lại.")
                 return Result(accepted, batch.cueIds.filterNot(accepted::containsKey), model, elapsedMs,
                     quotaWaitMs, GeminiGenerationMetrics.fromResponse(body),truncated=truncated)
             } catch (error: VideoApiException) { throw error }

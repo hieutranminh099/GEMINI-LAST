@@ -34,7 +34,7 @@ object VideoDownloads {
                 "Còn câu chưa dịch. Dịch hoặc sửa những câu trống trước khi tải phụ đề."
             }
             val data = (if (ass) VideoTimeline.ass(project) else VideoTimeline.srt(project.cues,project.durationMs)).toByteArray(Charsets.UTF_8)
-            publish(context.contentResolver, resultName(project.title, if (ass) "ass" else "srt"),
+            publish(context.contentResolver, resultName(project.title, if (ass) "ass" else "srt", project.targetLanguage),
                 if (ass) "text/x-ssa" else "application/x-subrip") { stream ->
                 currentCoroutineContext().ensureActive()
                 stream.write(data)
@@ -50,7 +50,7 @@ object VideoDownloads {
             // The rendered file belongs to this private project, not a caller-supplied source URI.
             val ownFolder = VideoStore(context).folder(project.id).canonicalFile
             require(source.canonicalFile.toPath().startsWith(ownFolder.toPath())) { "MP4 không thuộc dự án này." }
-            publish(context.contentResolver, resultName(project.title, "mp4"), "video/mp4") { stream ->
+            publish(context.contentResolver, resultName(project.title, "mp4", project.targetLanguage), "video/mp4") { stream ->
                 source.inputStream().use { input ->
                     val buffer = ByteArray(128 * 1024)
                     while (true) {
@@ -63,11 +63,12 @@ object VideoDownloads {
             }
         }
 
-    internal fun resultName(title: String, extension: String): String {
+    internal fun resultName(title: String, extension: String, language: String = "vi"): String {
         require(extension in setOf("srt", "ass", "mp4"))
         val clean = title.substringBeforeLast('.', title).replace(Regex("[\\p{Cntrl}/\\\\:*?\"<>|]"), "_")
             .trim().trim('.').take(72).ifBlank { "video" }
-        return "$clean-vi-${UUID.randomUUID().toString().take(8)}.$extension"
+        require(language in setOf("vi", "en"))
+        return "$clean-$language-${UUID.randomUUID().toString().take(8)}.$extension"
     }
 
     @RequiresApi(29)

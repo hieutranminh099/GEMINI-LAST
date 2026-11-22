@@ -185,6 +185,10 @@ class VideoCloudSync internal constructor(
             status("Đồng bộ đang nhường tài nguyên cho Live/tác vụ video.",busy=true);delay(500)
         }
         if(state.value.accountEmail!=email)throw DriveAuthorizationRequired()
+    }, refreshSyncToken={ rejected ->
+        if (state.value.accountEmail != email) throw DriveAuthorizationRequired()
+        Identity.getAuthorizationClient(context).clearToken(ClearTokenRequest.builder().setToken(rejected).build()).await()
+        accessToken(email)
     })
     internal fun repositoryForMovies(email:String)=repository(email)
 
@@ -236,6 +240,22 @@ class VideoCloudSync internal constructor(
         WorkManager.getInstance(context).enqueueUniqueWork("$TAG-$projectId",ExistingWorkPolicy.REPLACE,work)
         status("Đã xếp hàng sao lưu ${project.title.take(60)}${if(current.wifiOnly)"; chờ Wi-Fi/mạng không tính dung lượng" else ""}.")
     }
+    internal suspend fun backupProject(id: String) = operation.withLock {
+        val email = state.value.accountEmail
+        try {
+            val project = withContext(Dispatchers.IO) { VideoStore(context).load(id) }
+            require(ready(project)) { "Dịch xong dự án trước khi sao lưu." }
+            val stamp = fingerprint(project)
+            val key = marker(email, id)
+            if (prefs.getString(key, "") != stamp) {
+                status("Đang sao lưu dự án đã chọn…", true)
+                repository(email).publish(project) { status(it, true) }
+                prefs.edit().putString(key, stamp).apply()
+            }
+            status("Đã sao lưu dự án đã chọn lên Drive.")
+        } catch (e: CancellationException) { status("Đã dừng sao lưu dự án."); throw e }
+        catch (e: Exception) { status(errorMessage(e), needsAuth = e is DriveAuthorizationRequired); throw e }
+    }
     suspend fun listCloud():List<CloudVideoSnapshot> = operation.withLock{
         val email=state.value.accountEmail
         try{status("Đang tải danh sách Google Drive…",true)
@@ -252,6 +272,27 @@ class VideoCloudSync internal constructor(
         }catch(e:CancellationException){status("Đã dừng tải bản sao; dự án cũ trên máy giữ nguyên.");throw e}
         catch(e:Exception){status(errorMessage(e),needsAuth=e is DriveAuthorizationRequired);throw e}
     }
+    internal suspend fun geminiSettings(password: CharArray, restore: Boolean) = operation.withLock {
+        val email = state.value.accountEmail
+        try {
+            status(if (restore) "Đang tải cấu hình Gemini…" else "Đang mã hóa và sao lưu cấu hình Gemini…", true)
+            withContext(Dispatchers.IO) {
+                val repo = repository(email)
+                val settings = com.gemini.ocr.settings.AppSettings(context)
+                if (restore) {
+                    val envelope = repo.latestGemini()
+                    check(state.value.accountEmail == email)
+                    settings.restoreGemini(envelope, password)
+                } else repo.publishGemini(settings.backupGemini(password))
+            }
+            status(if (restore) "Đã mở khóa và khôi phục cấu hình Gemini." else "Drive đã xác nhận bản sao cấu hình Gemini.")
+        } catch (e: CancellationException) {
+            status("Đã dừng đồng bộ cấu hình Gemini."); throw e
+        } catch (e: Exception) {
+            status("Đồng bộ cấu hình Gemini chưa hoàn tất.", needsAuth = e is DriveAuthorizationRequired); throw e
+        } finally { password.fill('\u0000') }
+    }
+
     fun disconnect(){
         // Forget this app's account selection; never sign out of Android or delete Drive/user data.
         playbackGeneration.incrementAndGet()
