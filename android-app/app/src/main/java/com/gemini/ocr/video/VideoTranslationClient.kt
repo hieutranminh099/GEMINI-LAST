@@ -170,11 +170,15 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             val terms=PhoneTranslationCache.parseGlossary(glossary)
             context.put("promptRevision",VideoDialoguePrompt.REVISION).put("profile",profile).put("glossary",JSONObject(terms))
             context.put("targetLanguage", batch.targetLanguage)
-            if (batch.strictDialogue && VideoDialoguePrompt.attachSceneNotes(dialogue, context.optString("filmContext"))) {
-                val thinking = if (batch.requestModel.startsWith("gemini-2.5-")) JSONObject().put("thinkingBudget", 512)
-                    else JSONObject().put("thinkingLevel", "low")
-                request.getJSONObject("generationConfig").put("thinkingConfig", thinking)
+            val hasSceneNotes = batch.strictDialogue && VideoDialoguePrompt.attachSceneNotes(dialogue, context.optString("filmContext"))
+            // Flash 3.8 supports low, medium and high. Its documented default is medium.
+            val videoThinking = when {
+                batch.requestModel == AppSettings.VIDEO_FLASH_MODEL -> JSONObject().put("thinkingLevel", "medium")
+                !hasSceneNotes -> null
+                batch.requestModel.startsWith("gemini-2.5-") -> JSONObject().put("thinkingBudget", 512)
+                else -> JSONObject().put("thinkingLevel", "low")
             }
+            if (videoThinking != null) request.getJSONObject("generationConfig").put("thinkingConfig", videoThinking)
             if (batch.targetLanguage == "en") {
                 for (i in 0 until dialogue.length()) {
                     val row = dialogue.getJSONObject(i)

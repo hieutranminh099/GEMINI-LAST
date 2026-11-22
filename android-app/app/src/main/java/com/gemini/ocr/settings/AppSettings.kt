@@ -209,7 +209,8 @@ class AppSettings(private val context: Context) {
 
     companion object {
         private val credentialLock = Any()
-        val VIDEO_MODELS = listOf(com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite")
+        const val VIDEO_FLASH_MODEL = "gemini-3.8-flash"
+        val VIDEO_MODELS = listOf(com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL, VIDEO_FLASH_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite")
     }
     var videoTextModel: String
         get() = prefs.getString("video_text_model", null)?.takeIf { it in VIDEO_MODELS } ?: VIDEO_MODELS.first()

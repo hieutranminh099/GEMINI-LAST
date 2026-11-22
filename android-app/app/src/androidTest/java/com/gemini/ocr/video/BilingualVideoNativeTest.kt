@@ -79,13 +79,14 @@ class BilingualVideoNativeTest {
                 }
                 if (simulate) settings.videoTextModel = "gemini-2.5-flash" else {
                     // Only the acceptance test selects an accessible model, before any translation.
-                    for (model in AppSettings.VIDEO_MODELS) {
+                    val candidates = (listOf(AppSettings.VIDEO_FLASH_MODEL) + AppSettings.VIDEO_MODELS).distinct()
+                    for (model in candidates) {
                         settings.videoTextModel = model
                         try {
                             VideoTranslationClient(context).checkModel()
                             break
                         } catch (error: VideoApiException) {
-                            if (error.code != "API_MODEL" || model == AppSettings.VIDEO_MODELS.last()) throw error
+                            if (error.code !in setOf("API_MODEL", "API_AUTH") || model == candidates.last()) throw error
                         }
                     }
                 }
@@ -94,9 +95,6 @@ class BilingualVideoNativeTest {
                 settings.restoreGemini(JSONObject(recoveryFile.readText()), password)
                 assertEquals(File(context.filesDir, "expected-model").readText(), settings.videoTextModel)
                 if (!simulate) VideoTranslationClient(context).checkModel()
-            }
-            if (!sourcePhase && !simulate) {
-                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
             }
             if (sourcePhase) File(context.filesDir, "expected-model").writeText(settings.videoTextModel)
             evidence.appendText("model=${settings.videoTextModel}\n")
@@ -217,6 +215,8 @@ class BilingualVideoNativeTest {
                 settings.standaloneApiKey = ""
                 assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
                 assertFalse(settings.hasGeminiVideoKey())
+            } else if (!simulate) {
+                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
             }
         } finally {
             VideoTranslationClient.overrideResponseForTest = null
@@ -261,6 +261,7 @@ class BilingualVideoNativeTest {
             00:56 | Kai opens the door, sees his mother and his classmate, turns to his mother and questions both people.
         """.trimIndent()
         val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
+        val unresolved = mutableListOf<String>()
         for (language in listOf("vi", "en")) {
             val request = batch.copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
             val result = client.translate(settings.effectiveStandaloneApiKey(), request, "document", "") {}
@@ -278,7 +279,7 @@ class BilingualVideoNativeTest {
                         java.text.Normalizer.Form.NFC).lowercase()
                     val corrected = alternatives.any(revised::contains)
                     evidence.appendText("excerpt_${language}_${label}_retry=${if (corrected) "MATCH" else "REVIEW"}\n")
-                    assertTrue("Scene context required for excerpt $index ($language/$label)", corrected)
+                    if (!corrected) unresolved += "$language/$label"
                 }
             }
             if (language == "vi") {
@@ -303,5 +304,6 @@ class BilingualVideoNativeTest {
             assertFalse("A second teacher was invented", listOf("đinh", "ding").any { text[12].contains(it) })
             evidence.appendText("excerpt_rows_$language=${text.size}\n")
         }
+        assertTrue("Unresolved contextual references: $unresolved", unresolved.isEmpty())
     }
 }

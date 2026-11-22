@@ -31,6 +31,15 @@ class BilingualProjectTest {
         assertTrue(VideoDownloads.resultName("Film.mp4","srt","en").contains("-en-"))
     }
 
+    @Test fun selectedFlashModelUsesSupportedThinkingAndLeavesTheExistingDefaultIntact() {
+        val options = com.gemini.ocr.settings.AppSettings
+        assertEquals(com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL, options.VIDEO_MODELS.first())
+        val batch = VideoTranslationPlan.forCue(old.cues, 1).copy(targetLanguage = "en",
+            requestModel = options.VIDEO_FLASH_MODEL, strictDialogue = true)
+        val config = JSONObject(VideoTranslationClient.buildRequest(batch, "document", "")).getJSONObject("generationConfig")
+        assertEquals("medium", config.getJSONObject("thinkingConfig").getString("thinkingLevel"))
+    }
+
     @Test fun timedSceneNotesUseTheSharedSourceClockAndDoNotLeakAcrossGaps() {
         val rows = org.json.JSONArray(old.cues.map { it.json() })
         val supplied = "The teacher is the host.\n00:00.829 | first\n00:00,830 | second\n00:01.800 | gap\n00:00:02 | third"
