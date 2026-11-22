@@ -1,0 +1,42 @@
+name: Android bilingual video verification
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex-dev]
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[verify-bilingual]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare the synthetic Mandarin fixture tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq espeak-ng ffmpeg fonts-noto-cjk
+          python scripts/setup_android_asr.py
+      - name: Build both disposable APKs
+        working-directory: android-app
+        run: bash gradlew -PverificationAppId=com.gemini.ocr.bilingualtest :app:assembleDebug :app:assembleDebugAndroidTest --max-workers=2
+      - name: Start isolated Android
+        run: |
+          sudo chmod a+rw /dev/kvm
+          sdkmanager 'emulator' 'system-images;android-34;google_apis;x86_64'
+          echo no | avdmanager create avd -n bilingual -k 'system-images;android-34;google_apis;x86_64'
+          nohup "$ANDROID_HOME/emulator/emulator" -avd bilingual -no-window -no-snapshot -no-audio -gpu swiftshader_indirect > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          timeout 240 bash -c 'until [[ $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") == 1 ]]; do sleep 2; done'
+          adb shell input keyevent 82
+          adb install android-app/app/build/outputs/apk/debug/app-debug.apk
+          adb install android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+      - name: Exercise both languages, exports and clean installation key recovery
+        env:
+          GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
+        run: bash scripts/verify_bilingual_android.sh
