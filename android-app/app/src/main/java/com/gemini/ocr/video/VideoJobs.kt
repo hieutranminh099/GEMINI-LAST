@@ -845,7 +845,7 @@ class VideoJobs internal constructor(
                                     return if(economy!=null)economy.translate(AppSettings(context).effectiveStandaloneApiKey(),batch,p.profile,p.glossary,dispatch)
                                     else textClient.translate(AppSettings(context).effectiveStandaloneApiKey(),batch,p.profile,p.glossary,onRetry=::retryCheckpoint,beforeDispatch=dispatch)
                                 }
-                                val outcome=try { VideoRequestDeadline.run(hybrid, pipelineStage != null, economy != null) { request() } }
+                                val outcome=try { VideoRequestDeadline.run(batch.usesDialogueDeadline, pipelineStage != null, economy != null) { request() } }
                                 catch(e:TimeoutCancellationException){throw VideoApiException("API_TIMEOUT", transient = true,
                                     nextRetryAt = pipelineStage?.let { p.pipeline.task(it).nextRetryAt } ?: 0,
                                     detail = "Gemini chưa hoàn tất trong thời gian chờ. Các câu đã lưu được giữ.")}

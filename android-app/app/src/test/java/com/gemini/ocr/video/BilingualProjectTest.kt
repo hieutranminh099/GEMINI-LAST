@@ -36,6 +36,9 @@ class BilingualProjectTest {
         assertEquals(com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL, options.VIDEO_MODELS.first())
         val batch = VideoTranslationPlan.forCue(old.cues, 1).copy(targetLanguage = "en",
             requestModel = options.VIDEO_FLASH_MODEL, strictDialogue = true)
+        assertTrue(batch.usesDialogueDeadline)
+        assertFalse(batch.copy(strictDialogue = false).usesDialogueDeadline)
+        assertEquals(240_000, VideoTranslationClient.requestClient(batch.usesDialogueDeadline).callTimeoutMillis)
         val config = JSONObject(VideoTranslationClient.buildRequest(batch, "document", "")).getJSONObject("generationConfig")
         assertEquals("medium", config.getJSONObject("thinkingConfig").getString("thinkingLevel"))
     }

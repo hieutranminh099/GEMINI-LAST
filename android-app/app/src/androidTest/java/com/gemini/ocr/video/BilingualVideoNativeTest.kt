@@ -118,7 +118,7 @@ class BilingualVideoNativeTest {
                 dialogueContext = "The student speaks to teacher Liu in her kitchen after dinner. They are clearing the dishes.", roi = listOf(.25f, .80f, .75f, .86f),
                 style = p.style.copy(coverOriginal = true, coverFrame = VideoSubtitleFrame(.06f, .72f, .94f, .96f))))
             suspend fun waitForJob() {
-                withTimeout(150_000L) { while (jobs.busy.value != null) delay(100) }
+                withTimeout(VideoFullDialoguePlan.REQUEST_TIMEOUT_MS + 30_000L) { while (jobs.busy.value != null) delay(100) }
             }
             VideoPreviewDiagnostics.onPlayerForTest = { id, value -> if (id == p.id) player.set(value) }
             VideoPreviewDiagnostics.onFrameForTest = { value -> if (value.projectId == p.id) preview.set(value) }

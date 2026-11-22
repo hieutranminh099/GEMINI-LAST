@@ -18,7 +18,9 @@ object VideoTranslationPlan {
         val targetLanguage:String="vi",
         val requestModel:String=com.gemini.ocr.network.StandaloneTranslator.FAST_MODEL,
         val strictDialogue:Boolean=false
-    )
+    ) {
+        internal val usesDialogueDeadline: Boolean get() = fullDialogue || strictDialogue
+    }
 
     fun needsLocalDraft(cue:VideoCue,hybrid:Boolean):Boolean = !cue.protectedText && cue.translation.isBlank() &&
         (!hybrid || cue.localDraft.isBlank())

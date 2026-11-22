@@ -69,7 +69,7 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             val request = Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/models/${batch.requestModel}:generateContent")
                 .header("x-goog-api-key", selectedKey)
                 .post(singleAttemptBody(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))).build()
-            VideoApiRecovery.exchange(requestClient(batch.fullDialogue), request)
+            VideoApiRecovery.exchange(requestClient(batch.usesDialogueDeadline), request)
         }
         val body = if (context == null) VideoApiRecovery.run(beforeDispatch, onRetry = onRetry) { operation(apiKey) }
             else VideoGeminiAccounts.request(context, apiKey, beforeDispatch, onRetry, operation)
