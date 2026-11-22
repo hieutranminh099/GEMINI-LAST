@@ -2,14 +2,19 @@ name: Android bilingual video verification
 on:
   workflow_dispatch:
   push:
-    branches: [codex-dev]
+    branches: [codex-dev, codex/final-android-stabilization]
 permissions:
   contents: read
 jobs:
-  verify:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[verify-bilingual]')
+  android-instrumentation:
+    name: Android instrumentation (${{ matrix.suite }})
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/final-android-stabilization' || contains(github.event.head_commit.message, '[verify-bilingual]')
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [technical, gemini-quality]
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,6 +25,7 @@ jobs:
           java-version: '17'
       - name: Prepare the synthetic Mandarin fixture tools
         run: |
+          echo "VERIFICATION_EVIDENCE=$RUNNER_TEMP/bilingual-evidence.txt" >> "$GITHUB_ENV"
           sudo apt-get update -qq
           sudo apt-get install -y -qq espeak-ng ffmpeg fonts-noto-cjk
           python scripts/setup_android_asr.py
@@ -61,15 +67,96 @@ jobs:
           adb install -t android-app/app/build/outputs/apk/debug/app-debug.apk
           adb install -t android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Check native media export and Android Keystore recovery with controlled translations
+        if: matrix.suite == 'technical'
         run: bash scripts/verify_bilingual_android.sh fixture
-      - name: Exercise both languages, exports and clean installation key recovery
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+      - name: Exercise live translation, export and clean installation key recovery
+        if: matrix.suite == 'gemini-quality'
         env:
           GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
         run: bash scripts/verify_bilingual_android.sh gemini
+      - name: Score VI and EN contextual excerpt translations and record Gemini timings
+        if: ${{ !cancelled() && matrix.suite == 'gemini-quality' && steps.install.outcome == 'success' }}
+        env:
+          GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
+        run: bash scripts/verify_bilingual_android.sh quality
+      - name: Upload sanitized bilingual integration evidence
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bilingual-${{ matrix.suite }}-evidence
+          path: ${{ env.VERIFICATION_EVIDENCE }}
+      - name: Build and install network-disabled stability APKs
+        id: stability
+        if: ${{ !cancelled() && matrix.suite == 'technical' && steps.install.outcome == 'success' }}
+        run: |
+          (cd android-app && bash gradlew -PverificationAppId=com.gemini.ocr.codexbench -PverificationOffline=true :app:assembleDebug :app:assembleDebugAndroidTest --max-workers=2)
+          adb install -t android-app/app/build/outputs/apk/debug/app-debug.apk
+          adb install -t android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+      - name: Edit and merge bilingual cues and reopen the long project
+        if: ${{ !cancelled() && steps.stability.outcome == 'success' }}
+        run: bash scripts/verify_android_video_stability.sh edits
+      - name: Force-stop Android and recover the interrupted project
+        if: ${{ !cancelled() && steps.stability.outcome == 'success' }}
+        run: bash scripts/verify_android_video_stability.sh interruption
+      - name: Pause and resume a 36-minute synthetic video with native OCR
+        if: ${{ !cancelled() && steps.stability.outcome == 'success' }}
+        run: bash scripts/verify_android_video_stability.sh long
+
+  android-checks:
+    name: Android unit tests, lint and debug APK
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/final-android-stabilization' || contains(github.event.head_commit.message, '[verify-bilingual]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare the Android speech runtime
+        run: python scripts/setup_android_asr.py
+      - name: Build the standard debug APK
+        working-directory: android-app
+        run: bash gradlew :app:assembleDebug --max-workers=2
+      - name: Verify debug APK signature and record SHA-256
+        id: debug-apk
+        run: |
+          set -euo pipefail
+          apk=android-app/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$apk"
+          mkdir -p "$RUNNER_TEMP/debug-apk"
+          cp "$apk" "$RUNNER_TEMP/debug-apk/"
+          (cd "$RUNNER_TEMP/debug-apk" && sha256sum app-debug.apk > SHA256SUMS.txt)
+      - name: Publish the debug APK and checksum
+        if: steps.debug-apk.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-last-debug-apk
+          path: ${{ runner.temp }}/debug-apk/
+      - name: Run Android JVM tests
+        if: ${{ !cancelled() }}
+        working-directory: android-app
+        run: bash gradlew :app:testDebugUnitTest --max-workers=2
+      - name: Run Android Lint
+        if: ${{ !cancelled() }}
+        working-directory: android-app
+        run: bash gradlew :app:lintDebug --max-workers=2
+      - name: Check internal document links
+        if: ${{ !cancelled() }}
+        run: python scripts/check_codex_docs.py
+      - name: Upload Android unit and lint reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unit-lint
+          path: |
+            android-app/app/build/test-results/testDebugUnitTest/*.xml
+            android-app/app/build/reports/lint-results-debug.xml
 
   windows-tests:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[verify-bilingual]')
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/final-android-stabilization' || contains(github.event.head_commit.message, '[verify-bilingual]')
     runs-on: windows-2022
     timeout-minutes: 12
     steps:

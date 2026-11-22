@@ -138,3 +138,9 @@ Workflow `Single-video Android benchmark` chạy khi nhánh `perf/single-video` 
 ## Kiểm tra trải nghiệm Kho phim và trình phát
 
 Nhánh `perf/movie-experience` lấy `052d22d` làm đối chứng và chạy `MoviePlaybackBenchmarkTest` trên cùng máy ảo Android. Hai APK kiểm thử dùng riêng package `com.gemini.ocr.playbacktest` và tắt quyền mạng. Clip tổng hợp 24 giây có hình động H.264 và âm thanh AAC. Kết quả ghi năm lượt mở phim, tua khi đang phát hoặc tạm dừng, đổi tập và số lần cập nhật phụ đề. Ca riêng kiểm tra mở danh mục có tám phim, mỗi phim 5.065 câu. Artifact giữ kết quả, ảnh Kho phim và ảnh trình phát. Đo thời gian ở môi trường giả lập dùng để đối chiếu giữa hai bản.
+
+## Nghiệm thu Android song ngữ
+
+[Android bilingual video verification](.github/workflows/bilingual-video.yml) chạy Android JVM, lint, Companion trên Windows và hai job instrumentation độc lập. Job kỹ thuật dùng phản hồi cố định để kiểm tra nhập, xem trước, che chữ, xuất và khôi phục cấu hình trên bản cài sạch. Nó cũng kiểm tra chỉnh sửa, gộp cue gần cuối video tổng hợp dài 36 phút 25 giây, dừng tiến trình trong lúc xử lý và tiếp tục OCR từ checkpoint. Job Gemini dùng khóa thử của Actions để chấm lời thoại Việt và Anh, với quan sát cảnh gắn mốc `02:29` trên timeline fixture. Báo cáo job này ghi riêng lỗi API, lượt cần duyệt bản dịch và thời gian chuẩn bị request, chờ lượt gọi, kết nối, tải dữ liệu, nhận phản hồi và phân tích JSON. Cả hai job dùng clip thử nghiệm tổng hợp.
+
+Artifact `android-unit-lint` chứa kết quả JUnit và báo cáo lint. Artifact `gemini-last-debug-apk` chứa APK debug và SHA-256. Các artifact `bilingual-technical-evidence` và `bilingual-gemini-quality-evidence` chứa kết quả đã lọc từ instrumentation. Xem [quy trình nghiệm thu Drive thật](docs/VIDEO_TRANSLATOR_V170.md#dự-án-video-riêng-trên-android) để chạy upload và restore bằng tài khoản Google thử nghiệm đã cấp quyền.
