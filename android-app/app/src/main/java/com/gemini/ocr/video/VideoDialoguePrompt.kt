@@ -5,7 +5,7 @@ import org.json.JSONArray
 
 /** Video-only dialogue contract. Changing it must also change the private request identity. */
 internal object VideoDialoguePrompt {
-    const val REVISION = "video-dialogue-quality-v4"
+    const val REVISION = "video-dialogue-quality-v5"
 
     private val timeNote = Regex("""^(?:(\d{1,3}):)?(\d{1,3}):([0-5]\d)(?:[,.](\d{1,3}))?\s*\|\s*(.+)$""")
 
@@ -40,7 +40,9 @@ internal object VideoDialoguePrompt {
             Preserve who acts on whom, kinship, profession, negation and speaker intent. Distinguish literal
             statements from a host's politeness. Use an English form of address appropriate to the relationship.
             A row’s sceneNote describes exactly what is visible or who is present during that utterance.
-            Use this evidence to resolve what is omitted in that row. When the scene
+            Use this evidence to resolve what is omitted in that row. When the schema requests
+            resolvedSource, first express the full meaning in Chinese using only confirmed scene details.
+            Translate that expanded meaning, including its recovered nouns and addressees. When the scene
             identifies the physical object of an action omitted in Chinese, name that object in the subtitle.
             Keep an explicitly plural addressee plural in English. If the scene identifies the exact number
             of listeners, express that number when plain "you" would lose it. Keep a supported family
@@ -65,7 +67,7 @@ internal object VideoDialoguePrompt {
 
             Xưng hô: xác định ai nói với ai từ các lượt thoại trong cùng cảnh và bằng chứng về quan hệ, vai vế, thái độ. Giữ cách xưng hô phù hợp ở các câu kế tiếp; chỉ đổi khi có căn cứ đổi người nói, người nghe, quan hệ hoặc giọng điệu. Không áp một cặp đại từ cho toàn bộ phim hoặc gán hai cảnh khác nhau cho cùng người. Khi thiếu căn cứ, diễn đạt trung tính; không tự gán tuổi, giới tính, anh/em, cha/con hay vợ/chồng. Phân biệt người tác động và đối tượng ở câu bị động, lời khách sáo của chủ nhà, đồ vật bị lược trong cảnh. Không gộp các tên OCR gần âm nếu chưa có xác nhận. Giữ chủ thể cần thiết để không làm sai người thực hiện hoặc đối tượng hành động.
 
-            sceneNote của từng câu mô tả chính cảnh đang hiện khi câu ấy được nói. Dùng chi tiết trong sceneNote để làm rõ chính lời thoại đó. Khi tiếng Trung lược tân ngữ của một hành động và hình ảnh hoặc ghi chú xác định được đồ vật, hãy gọi tên đồ vật ngay trong lời dịch. Người xem cần hiểu ai làm gì cho ai dù chỉ nhìn thấy một phụ đề. Với câu hướng đến nhiều người, giữ số người nghe khi cảnh đã xác định và dùng cách gọi đúng quan hệ nếu một người là người thân.
+            sceneNote của từng câu mô tả chính cảnh đang hiện khi câu ấy được nói. Dùng chi tiết trong sceneNote để làm rõ chính lời thoại đó. Khi cấu trúc kết quả có trường resolvedSource, trước tiên hãy viết lại câu tiếng Trung với các chủ thể, tân ngữ hoặc người nghe đã xác định rõ ở cảnh này. Dịch trọn ý của câu đã làm rõ đó, gồm cả danh từ và người nghe được khôi phục. Khi tiếng Trung lược tân ngữ của một hành động và hình ảnh hoặc ghi chú xác định được đồ vật, hãy gọi tên đồ vật ngay trong lời dịch. Người xem cần hiểu ai làm gì cho ai dù chỉ nhìn thấy một phụ đề. Với câu hướng đến nhiều người, giữ số người nghe khi cảnh đã xác định và dùng cách gọi đúng quan hệ nếu một người là người thân.
 
             Văn phong: dùng câu tiếng Việt nói được trong hoàn cảnh đó, giữ sắc thái lịch sự, thân mật, tức giận, mỉa mai và thành ngữ theo ngữ cảnh. Không thêm lời dẫn, chú giải hay giải thích song ngữ. Giữ nhất quán tên riêng; dùng tên Hán Việt hoặc Latin đã có căn cứ, không tự đặt tên khác hoặc chèn chữ Kirill. Giữ đủ phủ định, điều kiện, thời điểm, số lượng, đơn vị và đúng đối tượng; không đổi câu hỏi thành khẳng định.
 

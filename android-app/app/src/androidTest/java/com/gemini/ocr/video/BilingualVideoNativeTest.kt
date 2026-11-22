@@ -79,7 +79,7 @@ class BilingualVideoNativeTest {
                 }
                 if (simulate) settings.videoTextModel = "gemini-2.5-flash" else {
                     // Only the acceptance test selects an accessible model, before any translation.
-                    val candidates = (listOf(AppSettings.VIDEO_FLASH_MODEL) + AppSettings.VIDEO_MODELS).distinct()
+                    val candidates = AppSettings.VIDEO_MODELS
                     for (model in candidates) {
                         settings.videoTextModel = model
                         try {
@@ -261,6 +261,7 @@ class BilingualVideoNativeTest {
             00:56 | Kai opens the door, sees his mother and his classmate, turns to his mother and questions both people.
         """.trimIndent()
         val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
+        val initialModel = settings.videoTextModel
         val unresolved = mutableListOf<String>()
         for (language in listOf("vi", "en")) {
             val request = batch.copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
@@ -272,9 +273,29 @@ class BilingualVideoNativeTest {
                 val found = alternatives.any { text[index].contains(it) }
                 evidence.appendText("excerpt_${language}_$label=${if (found) "MATCH" else "REVIEW"}\n")
                 if (!found && label in setOf("dishes", "pair")) {
-                    val single = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, index), context)
-                        .copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
-                    val retry = client.translate(settings.effectiveStandaloneApiKey(), single, "document", "") {}
+                    // Exercise the same explicit model selection and single-cue request used
+                    // when the reviewer asks for a second translation of an ambiguous line.
+                    val retryModel = AppSettings.VIDEO_FLASH_MODEL
+                    evidence.appendText("excerpt_${language}_${label}_model=$retryModel\n")
+                    val retry = try {
+                        settings.videoTextModel = retryModel
+                        client.checkModel()
+                        val single = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, index), context)
+                            .copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
+                        VideoRequestDeadline.run(single.usesDialogueDeadline, staged = false, economy = false) {
+                            client.translate(settings.effectiveStandaloneApiKey(), single, "document", "") {}
+                        }
+                    } catch (error: VideoApiException) {
+                        evidence.appendText("excerpt_${language}_${label}_retry=${error.code}\n")
+                        unresolved += "$language/$label/${error.code}"
+                        return
+                    } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
+                        evidence.appendText("excerpt_${language}_${label}_retry=TIMEOUT\n")
+                        unresolved += "$language/$label/TIMEOUT"
+                        return
+                    } finally {
+                        settings.videoTextModel = initialModel
+                    }
                     val revised = java.text.Normalizer.normalize(retry.accepted.getValue(rows[index].id),
                         java.text.Normalizer.Form.NFC).lowercase()
                     val corrected = alternatives.any(revised::contains)

@@ -171,9 +171,9 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             context.put("promptRevision",VideoDialoguePrompt.REVISION).put("profile",profile).put("glossary",JSONObject(terms))
             context.put("targetLanguage", batch.targetLanguage)
             val hasSceneNotes = batch.strictDialogue && VideoDialoguePrompt.attachSceneNotes(dialogue, context.optString("filmContext"))
-            // Flash 3.8 supports low, medium and high. Its documented default is medium.
+            // Flash 3.8 supports low, medium and high. Spend extra reasoning on grounded scene notes.
             val videoThinking = when {
-                batch.requestModel == AppSettings.VIDEO_FLASH_MODEL -> JSONObject().put("thinkingLevel", "medium")
+                batch.requestModel == AppSettings.VIDEO_FLASH_MODEL -> JSONObject().put("thinkingLevel", if (hasSceneNotes) "medium" else "low")
                 !hasSceneNotes -> null
                 batch.requestModel.startsWith("gemini-2.5-") -> JSONObject().put("thinkingBudget", 512)
                 else -> JSONObject().put("thinkingLevel", "low")
@@ -195,6 +195,13 @@ internal class VideoTranslationClient(private val context: Context? = null) {
                 })
                 .put("translation",JSONObject().put("type","STRING")))
                 .put("required",JSONArray().put("id").put("translation"))
+            // A focused retry can resolve an ellipsis before translating. This intermediate
+            // field is neither accepted as a source edit nor persisted in either subtitle track.
+            if (batch.cueIds.size == 1 && byId.getValue(batch.cueIds.single()).has("sceneNote")) {
+                item.getJSONObject("properties").put("resolvedSource", JSONObject().put("type", "STRING"))
+                item.getJSONArray("required").put("resolvedSource")
+                item.put("propertyOrdering", JSONArray(listOf("id", "resolvedSource", "translation")))
+            }
             request.getJSONObject("generationConfig").put("maxOutputTokens",batch.maxOutputTokens)
                 .put("responseSchema",JSONObject().put("type","OBJECT").put("properties",JSONObject()
                     .put("translations",JSONObject().put("type","ARRAY").put("items",item)))

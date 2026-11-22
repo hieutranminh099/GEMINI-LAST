@@ -40,7 +40,13 @@ class BilingualProjectTest {
         assertFalse(batch.copy(strictDialogue = false).usesDialogueDeadline)
         assertEquals(240_000, VideoTranslationClient.requestClient(batch.usesDialogueDeadline).callTimeoutMillis)
         val config = JSONObject(VideoTranslationClient.buildRequest(batch, "document", "")).getJSONObject("generationConfig")
-        assertEquals("medium", config.getJSONObject("thinkingConfig").getString("thinkingLevel"))
+        assertEquals("low", config.getJSONObject("thinkingConfig").getString("thinkingLevel"))
+        val noted = VideoStagedPipeline.withContext(batch, "00:01 | The student addresses a teacher.")
+        val noteConfig = JSONObject(VideoTranslationClient.buildRequest(noted, "document", "")).getJSONObject("generationConfig")
+        assertEquals("medium", noteConfig.getJSONObject("thinkingConfig").getString("thinkingLevel"))
+        val item = noteConfig.getJSONObject("responseSchema").getJSONObject("properties")
+            .getJSONObject("translations").getJSONObject("items")
+        assertEquals("resolvedSource", item.getJSONArray("propertyOrdering").getString(1))
     }
 
     @Test fun timedSceneNotesUseTheSharedSourceClockAndDoNotLeakAcrossGaps() {
