@@ -40,6 +40,11 @@ internal data class SubtitleBackdropPlan(val left: Float, val top: Float, val ri
 internal fun subtitleBackdropPlan(project: VideoProject): SubtitleBackdropPlan? {
     val style = project.style.displayStyle()
     if (!style.coverOriginal && (!style.blurOriginal || style.background || project.sourceMode == VideoSourceMode.ASR)) return null
+    if (style.coverOriginal && style.coverFrame != null) {
+        val frame = style.coverFrame
+        return SubtitleBackdropPlan(frame.left, frame.top, frame.right, frame.bottom,
+            listOf(0L to project.durationMs), opaque = true)
+    }
     val roi = project.roi
     if (roi.size != 4 || roi.any { !it.isFinite() || it !in 0f..1f } || roi[2] <= roi[0] || roi[3] <= roi[1]) return null
     if (style.coverOriginal) return SubtitleBackdropPlan(roi[0], roi[1], roi[2], roi[3],

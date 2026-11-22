@@ -818,11 +818,16 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     var background by rememberSaveable(project.id, project.style) { mutableStateOf(initial.background) }
     var outline by rememberSaveable(project.id, project.style) { mutableStateOf(initial.outline) }
     var coverOriginal by rememberSaveable(project.id, project.style) { mutableStateOf(initial.coverOriginal) }
+    var editingCover by rememberSaveable(project.id) { mutableStateOf(false) }
+    var coverBounds by rememberSaveable(project.id, project.style) {
+        mutableStateOf(initial.coverFrame?.let { floatArrayOf(it.left, it.top, it.right, it.bottom) })
+    }
     var blurOriginal by rememberSaveable(project.id, project.style) { mutableStateOf(initial.blurOriginal) }
     var yellowText by rememberSaveable(project.id, project.style) { mutableStateOf(initial.yellowText) }
     var resetFrame by rememberSaveable(project.id, project.style, initial.frame) { mutableStateOf(initial.frame == null && project.style.frame != null) }
     val style = project.style.copy(position = position, sizeFraction = size, background = background, outline = outline,
-        coverOriginal = coverOriginal, blurOriginal = blurOriginal, yellowText = yellowText, legacyDefault = false,
+        coverOriginal = coverOriginal, coverFrame = coverBounds?.let { VideoSubtitleFrame(it[0], it[1], it[2], it[3]) },
+        blurOriginal = blurOriginal, yellowText = yellowText, legacyDefault = false,
         frame = if (resetFrame) null else initial.frame)
     LaunchedEffect(style) { onPreview(style) }
     if(style.frame==null) {
@@ -836,6 +841,14 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(coverOriginal, { coverOriginal = it }, enabled = enabled)
         Text("Che kín toàn bộ vùng chữ gốc")
+    }
+    if (coverOriginal) {
+        OutlinedButton(onClick = { editingCover = true }, enabled = enabled) { Text("Chỉnh vùng che trên video") }
+        if (editingCover) VideoRegionDialog(project.copy(style = style), project.cues.firstOrNull()?.startMs ?: 0L,
+            ocr = false, cover = true, onCancel = { editingCover = false }, onConfirm = { frame ->
+            coverBounds = floatArrayOf(frame.left, frame.top, frame.right, frame.bottom)
+            editingCover = false
+        })
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(blurOriginal, onCheckedChange = { blurOriginal = it; if (it) background = false }, enabled = enabled)
@@ -856,7 +869,7 @@ internal fun VideoStyleEditor(project: VideoProject, enabled: Boolean,
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(onClick = { val defaults = VideoSubtitleStyle(); position = defaults.position; size = defaults.sizeFraction;
             background = defaults.background; outline = defaults.outline; blurOriginal = defaults.blurOriginal;
-            coverOriginal = false; yellowText = defaults.yellowText; resetFrame = true }, enabled = enabled) { Text("Đặt lại mặc định") }
+            coverOriginal = false; coverBounds = null; yellowText = defaults.yellowText; resetFrame = true }, enabled = enabled) { Text("Đặt lại mặc định") }
         Button(onClick = { onSave(style) }, enabled = enabled && style != project.style) { Text("Lưu cấu hình") }
     }
 }

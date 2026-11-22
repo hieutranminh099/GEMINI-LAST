@@ -153,7 +153,7 @@ Font preview/test lấy từ font Windows có trên máy; không đóng gói l�
 
 ## Dự án video riêng trên Android
 
-Trong màn hình dự án, **Ngôn ngữ đích → English** chọn dịch lời thoại Trung bằng Gemini. **Tiếng Việt** mở bản Việt đã lưu. Hai bản dùng chung nguồn, mốc thời gian, từ điển và ghi chú nhân vật trong **Thiết lập → Tùy chọn nâng cao**. Có thể nối hai mảnh của cùng một lượt thoại trong trình sửa câu rồi dịch lại. Trong phần kiểu phụ đề, **Che kín toàn bộ vùng chữ gốc** áp dụng vùng nguồn đã chọn cho cả trình phát và MP4.
+Trong màn hình dự án, **Ngôn ngữ đích → English** chọn dịch lời thoại Trung bằng Gemini. **Tiếng Việt** mở bản Việt đã lưu. Hai bản dùng chung nguồn, mốc thời gian, từ điển và ghi chú nhân vật trong **Thiết lập → Tùy chọn nâng cao**. Có thể nối hai mảnh của cùng một lượt thoại trong trình sửa câu rồi dịch lại. Trong phần kiểu phụ đề, **Che kín toàn bộ vùng chữ gốc** áp dụng cho cả trình phát và MP4. Chọn **Chỉnh vùng che trên video** để khoanh cả hai dòng chữ cũ sau khi đã dịch, rồi lưu cấu hình.
 
 Trong **Tùy chỉnh → Kết nối Gemini**, chọn model cho lời thoại video và kiểm tra kết nối. **Đồng bộ Google Drive → Thiết lập → Sao lưu riêng dự án này** lưu dự án đã dịch vào vùng dữ liệu ứng dụng của tài khoản đã cấp quyền. Mỗi lần khôi phục dự án tạo một bản riêng trên thiết bị.
 

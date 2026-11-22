@@ -44,6 +44,17 @@ class SubtitleBackdropTest {
         assertTrue(VideoTimeline.ass(project).contains("&H003BEBFF"))
     }
 
+    @Test fun coverCanBeReframedAfterTranslationWithoutChangingTheSourceTimelineOrOcrRoi() {
+        val p = project()
+        val mask = VideoSubtitleFrame(.02f, .56f, .98f, .85f)
+        val updated = VideoProject.from(p.copy(style = p.style.copy(coverOriginal = true, coverFrame = mask)).json())
+        val plan = requireNotNull(subtitleBackdropPlan(updated))
+        assertEquals(listOf(mask.left, mask.top, mask.right, mask.bottom), listOf(plan.left, plan.top, plan.right, plan.bottom))
+        assertTrue(plan.opaque && plan.activeAt(999_000))
+        assertEquals(p.roi, updated.roi)
+        assertEquals(p.cues, updated.cues)
+    }
+
     @Test fun narrowRoiIsExactAndSpeechOrBlankRowsNeverBlurThePicture() {
         val project = project().copy(roi = listOf(.2f, .8f, .8f, .85f))
         val plan = requireNotNull(subtitleBackdropPlan(project))

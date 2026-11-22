@@ -117,10 +117,12 @@ enum class SubtitleFrameHandle(val left: Boolean = false, val top: Boolean = fal
 data class VideoSubtitleStyle(val position: Float = .86f, val sizeFraction: Float = .045f,
     val background: Boolean = false, val outline: Boolean = true, val frame: VideoSubtitleFrame? = null,
     val blurOriginal: Boolean = true, val yellowText: Boolean = true,
-    val legacyDefault: Boolean = false, val coverOriginal: Boolean = false) {
+    val legacyDefault: Boolean = false, val coverOriginal: Boolean = false,
+    val coverFrame: VideoSubtitleFrame? = null) {
     fun json(): JSONObject = JSONObject().put("position", position).put("sizeFraction", sizeFraction)
         .put("background", background).put("outline", outline).put("frame", frame?.json() ?: JSONObject.NULL)
         .also { if (coverOriginal) it.put("coverOriginal", true) }
+        .also { json -> coverFrame?.let { json.put("coverFrame", it.json()) } }
         .also { if (!legacyDefault) it.put("blurOriginal", blurOriginal).put("yellowText", yellowText) }
     /** Rendering upgrades the old stock preset without rewriting a confirmed library snapshot. */
     fun displayStyle(): VideoSubtitleStyle = if (legacyDefault && background && outline && frame == null &&
@@ -135,7 +137,8 @@ data class VideoSubtitleStyle(val position: Float = .86f, val sizeFraction: Floa
                 j.optDouble("position", .86).toFloat().coerceIn(.05f,.95f),
                 j.optDouble("sizeFraction", .045).toFloat().coerceIn(.02f,.09f),
                 j.optBoolean("background",true),j.optBoolean("outline",true),VideoSubtitleFrame.from(j.optJSONArray("frame")),
-                j.optBoolean("blurOriginal",false),j.optBoolean("yellowText",false),legacyAppearance,j.optBoolean("coverOriginal"))
+                j.optBoolean("blurOriginal",false),j.optBoolean("yellowText",false),legacyAppearance,j.optBoolean("coverOriginal"),
+                VideoSubtitleFrame.from(j.optJSONArray("coverFrame")))
         }
     }
 }

@@ -41,8 +41,12 @@ import kotlinx.coroutines.sync.withLock
 @OptIn(ExperimentalLayoutApi::class, ExperimentalComposeUiApi::class)
 @Composable
 internal fun VideoRegionDialog(project:VideoProject, timeMs:Long, ocr:Boolean,
-    onCancel:()->Unit, onConfirm:(VideoSubtitleFrame)->Unit) {
-    val initial=if(ocr)VideoSubtitleFrame.fromRoi(project.roi) else project.style.frame?:VideoSubtitleFrame.BOTTOM
+    onCancel:()->Unit, onConfirm:(VideoSubtitleFrame)->Unit, cover:Boolean = false) {
+    val initial = when {
+        cover -> project.style.coverFrame ?: VideoSubtitleFrame.fromRoi(project.roi)
+        ocr -> VideoSubtitleFrame.fromRoi(project.roi)
+        else -> project.style.frame ?: VideoSubtitleFrame.BOTTOM
+    }
     var values by rememberSaveable(project.id,ocr) { mutableStateOf(listOf(initial.left,initial.top,initial.right,initial.bottom)) }
     val draft=VideoSubtitleFrame(values[0],values[1],values[2],values[3])
     var discard by rememberSaveable { mutableStateOf(false) }
@@ -83,7 +87,11 @@ internal fun VideoRegionDialog(project:VideoProject, timeMs:Long, ocr:Boolean,
         dismissOnBackPress=true,dismissOnClickOutside=false)) {
         Surface(Modifier.fillMaxSize().semantics{testTagsAsResourceId=true}) {
             Column(Modifier.fillMaxSize().padding(12.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
-                Text(if(ocr)"Chọn vùng chữ Trung" else "Chọn khung phụ đề Việt",style=MaterialTheme.typography.titleLarge)
+                Text(when {
+                    cover -> "Chọn vùng che chữ gốc"
+                    ocr -> "Chọn vùng chữ Trung"
+                    else -> "Chọn khung phụ đề dịch"
+                }, style = MaterialTheme.typography.titleLarge)
                 Text("Kéo trong khung để di chuyển; kéo cạnh hoặc góc để đổi kích thước. Chưa lưu thay đổi.",style=MaterialTheme.typography.bodySmall)
                 Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black).onSizeChanged{size=it},contentAlignment=Alignment.Center) {
                     bitmap?.let{image->
@@ -115,7 +123,7 @@ internal fun VideoRegionDialog(project:VideoProject, timeMs:Long, ocr:Boolean,
                 if(ocr && liveRunning)Text("Tạm dừng dịch trực tiếp để xem thử OCR.",style=MaterialTheme.typography.bodySmall)
                 FlowRow(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick=onCancel,modifier=Modifier.testTag("video_region_cancel")){Text("Hủy")}
-                    OutlinedButton(onClick={change(if(ocr)VideoSubtitleFrame.fromRoi(listOf(.06f,.72f,.94f,.96f)) else VideoSubtitleFrame.BOTTOM)},
+                    OutlinedButton(onClick={change(when { cover -> VideoSubtitleFrame.fromRoi(project.roi); ocr -> VideoSubtitleFrame.fromRoi(listOf(.06f,.72f,.94f,.96f)); else -> VideoSubtitleFrame.BOTTOM })},
                         enabled=!previewBusy,modifier=Modifier.testTag("video_region_reset")){Text("Đặt lại")}
                     if(ocr)OutlinedButton(onClick={
                         val selected=draft;previewBusy=true;previewText="Đang nhận diện vùng đã chọn…";previewError=false

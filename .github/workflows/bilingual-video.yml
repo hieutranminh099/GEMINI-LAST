@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           sudo chmod a+rw /dev/kvm
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           export ANDROID_AVD_HOME="$RUNNER_TEMP/bilingual-avds"
           mkdir -p "$ANDROID_AVD_HOME"
           image='system-images;android-34;google_apis;x86_64'
@@ -56,8 +57,8 @@ jobs:
         run: bash gradlew -PverificationAppId=com.gemini.ocr.bilingualtest :app:assembleDebug :app:assembleDebugAndroidTest --max-workers=2
       - name: Install verification app and instrumentation
         run: |
-          adb install android-app/app/build/outputs/apk/debug/app-debug.apk
-          adb install android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          adb install -t android-app/app/build/outputs/apk/debug/app-debug.apk
+          adb install -t android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Check native media export and Android Keystore recovery with controlled translations
         run: bash scripts/verify_bilingual_android.sh fixture
       - name: Exercise both languages, exports and clean installation key recovery

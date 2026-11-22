@@ -103,7 +103,8 @@ class BilingualVideoNativeTest {
             jobs.selectSubtitle(p.id, Uri.fromFile(subtitle), subtitle.name)
             val store = VideoStore(context)
             jobs.save(store.load(p.id).copy(translationMode = VideoTranslationMode.GEMINI, profile = "document",
-                dialogueContext = "The student speaks to teacher Liu in her kitchen after dinner. They are clearing the dishes.", style = p.style.copy(coverOriginal = true)))
+                dialogueContext = "The student speaks to teacher Liu in her kitchen after dinner. They are clearing the dishes.", roi = listOf(.25f, .80f, .75f, .86f),
+                style = p.style.copy(coverOriginal = true, coverFrame = VideoSubtitleFrame(.06f, .72f, .94f, .96f))))
             suspend fun waitForJob() {
                 withTimeout(150_000L) { while (jobs.busy.value != null) delay(100) }
             }
@@ -188,12 +189,60 @@ class BilingualVideoNativeTest {
                 settings.standaloneApiKey = ""
                 assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
                 assertFalse(settings.hasGeminiVideoKey())
+            } else if (!simulate) {
+                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
             }
         } finally {
             VideoTranslationClient.overrideResponseForTest = null
             VideoPreviewDiagnostics.onPlayerForTest = null
             VideoPreviewDiagnostics.onFrameForTest = null
             password.fill('\u0000')
+        }
+    }
+
+    /** Original review excerpts. No test name, timestamp or translation enters the app prompt code. */
+    private suspend fun verifyDialogueExcerpts(client: VideoTranslationClient, settings: AppSettings, evidence: File) {
+        val sources = listOf("哪个又被他盯上了？", "我妈是班主任。", "我妈不让我乱说。", "凯子。",
+            "强哥，我手上钱不够。", "张乔。", "都没准备什么菜。", "你妈妈是老师吗？",
+            "是我让小凯别说的。", "张强。", "我帮您洗吧。", "我爸忙着挣钱，顾不上我。",
+            "刘老师！", "章强。", "你们干嘛？")
+        val rows = sources.mapIndexed { i, text -> VideoCue("excerpt-$i", i * 4000L, i * 4000L + 3500, text) }
+        val context = "Teacher Liu is Li Kai's mother. Classmate Zhang Qiang visits unexpectedly. " +
+            "At dinner the table already has several dishes. After dinner the visitor offers to wash the dishes. " +
+            "Zhang Qiang then mentions his father. Kai addresses his mother and his classmate in the last line. " +
+            "Three unconfirmed OCR transcriptions of names occur. Their identities have not been verified."
+        val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
+        for (language in listOf("vi", "en")) {
+            val request = batch.copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
+            val result = client.translate(settings.effectiveStandaloneApiKey(), request, "document", "") {}
+            assertEquals(request.cueIds, result.accepted.keys.toList())
+            val text = rows.map { result.accepted.getValue(it.id).lowercase() }
+            // These checks cover explicit lexical evidence. Subtle pronouns need the original scene.
+            fun checkWords(label: String, index: Int, vararg alternatives: String) {
+                val found = alternatives.any { text[index].contains(it) }
+                evidence.appendText("excerpt_${language}_$label=${if (found) "MATCH" else "REVIEW"}\n")
+            }
+            if (language == "vi") {
+                checkWords("target", 0, "nhắm", "để mắt", "ngắm", "để ý", "lọt vào mắt", "tăm tia", "dòm ngó")
+                checkWords("teacher", 1, "chủ nhiệm")
+                checkWords("money", 4, "tiền")
+                checkWords("host", 6, "món", "đồ ăn", "thức ăn")
+                checkWords("dishes", 10, "bát", "chén")
+                checkWords("father", 11, "bố", "ba", "cha")
+                checkWords("address", 12, "cô lưu")
+                checkWords("pair", 14, "hai", "mẹ")
+            } else {
+                checkWords("target", 0, "eye", "sight", "target", "after", "pick", "mark", "watch")
+                checkWords("teacher", 1, "homeroom", "form teacher", "class teacher", "head teacher")
+                checkWords("money", 4, "money", "cash", "afford", "enough on me")
+                checkWords("host", 6, "dish", "food", "prepare", "special", "cook", "make much")
+                checkWords("dishes", 10, "dish", "wash up", "washing up")
+                checkWords("father", 11, "dad", "father")
+                checkWords("address", 12, "liu")
+                checkWords("pair", 14, "two", "both", "mom", "mum")
+            }
+            assertFalse("A second teacher was invented", listOf("đinh", "ding").any { text[12].contains(it) })
+            evidence.appendText("excerpt_rows_$language=${text.size}\n")
         }
     }
 }

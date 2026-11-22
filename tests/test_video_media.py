@@ -163,8 +163,17 @@ def test_real_owned_child_stops_work_while_priority_gate_is_closed(tmp_path):
     """Real process suspension; this does not claim a Live OCR latency benchmark."""
     from app.video_media import _process_options, stop_process
     async def scenario():
-        counter = tmp_path / 'counter.txt'
-        code = 'import pathlib,sys,time\np=pathlib.Path(sys.argv[1])\nfor i in range(500):\n p.write_text(str(i));time.sleep(.02)'
+        counter = tmp_path / 'progress.bin'
+        # Suspending a process between truncate and write can freeze an empty file.
+        # Each unbuffered append records one completed unit of work.
+        code = """
+import sys
+import time
+with open(sys.argv[1], 'ab', buffering=0) as progress:
+    for _ in range(500):
+        progress.write(b'x')
+        time.sleep(.02)
+"""
         process = await asyncio.create_subprocess_exec(sys.executable, '-c', code, str(counter),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, **_process_options())
         gate = asyncio.Event()
@@ -175,19 +184,19 @@ def test_real_owned_child_stops_work_while_priority_gate_is_closed(tmp_path):
             # assumed startup speed, before measuring actual suspension.
             deadline = asyncio.get_running_loop().time() + 15
             while asyncio.get_running_loop().time() < deadline:
-                if counter.exists() and counter.read_text().strip():
+                if counter.exists() and counter.stat().st_size:
                     break
                 await asyncio.sleep(.02)
-            assert counter.exists(), 'Generated child must start before checking suspension.'
+            assert counter.exists() and counter.stat().st_size, 'Generated child must start before checking suspension.'
             task = asyncio.create_task(wait_process_ready(process, gate.wait))
             await asyncio.sleep(.08)
-            frozen = counter.read_text()
+            frozen = counter.stat().st_size
             await asyncio.sleep(.12)
-            assert counter.read_text() == frozen
+            assert counter.stat().st_size == frozen
             gate.set()
             await task
             await asyncio.sleep(.10)
-            assert int(counter.read_text()) > int(frozen)
+            assert counter.stat().st_size > frozen
         finally:
             if task is not None and not task.done():
                 task.cancel()
