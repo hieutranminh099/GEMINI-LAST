@@ -56,12 +56,14 @@ jobs:
         working-directory: android-app
         run: bash gradlew -PverificationAppId=com.gemini.ocr.bilingualtest :app:assembleDebug :app:assembleDebugAndroidTest --max-workers=2
       - name: Install verification app and instrumentation
+        id: install
         run: |
           adb install -t android-app/app/build/outputs/apk/debug/app-debug.apk
           adb install -t android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Check native media export and Android Keystore recovery with controlled translations
         run: bash scripts/verify_bilingual_android.sh fixture
       - name: Exercise both languages, exports and clean installation key recovery
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         env:
           GEMINI_BENCHMARK_API_KEY: ${{ secrets.GEMINI_BENCHMARK_API_KEY }}
         run: bash scripts/verify_bilingual_android.sh gemini

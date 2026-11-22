@@ -1,6 +1,7 @@
 package com.gemini.ocr.video
 
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -99,6 +100,16 @@ class BilingualVideoNativeTest {
             val jobs = VideoJobs.get(context)
             val video = File(context.filesDir, "dialogue.mp4")
             val subtitle = File(context.filesDir, "zh.srt")
+            MediaMetadataRetriever().use { source ->
+                source.setDataSource(video.absolutePath)
+                for (ms in listOf(1500L, 5500L, 9500L)) {
+                    val bitmap = requireNotNull(source.getFrameAtTime(ms * 1000, MediaMetadataRetriever.OPTION_CLOSEST))
+                    try {
+                        assertTrue("Fixture must have a visible white bilingual band at ${ms}ms",
+                            bandPercentages(bitmap).first >= 75)
+                    } finally { bitmap.recycle() }
+                }
+            }
             val p = jobs.create(Uri.fromFile(video), "Dialogue.mp4")
             jobs.selectSubtitle(p.id, Uri.fromFile(subtitle), subtitle.name)
             val store = VideoStore(context)
@@ -165,11 +176,11 @@ class BilingualVideoNativeTest {
                         assertTrue(kotlin.math.abs(duration - p.durationMs) <= 150)
                         for (time in listOf(1500L, 5500L, 9500L)) {
                             val frame = requireNotNull(reader.getFrameAtTime(time * 1000, MediaMetadataRetriever.OPTION_CLOSEST))
-                            // The test source has a bright bilingual band inside this mask.
-                            for (y in listOf(.76f, .92f)) {
-                                val pixel = frame.getPixel((.09f * frame.width).toInt(), (y * frame.height).toInt())
-                                assertTrue("Source mask at ${time}ms y=$y", Color.red(pixel) < 35 && Color.green(pixel) < 35 && Color.blue(pixel) < 35)
-                            }
+                            // A wrapped yellow glyph can cross either margin. Check the whole
+                            // former white band for exposed source pixels and opaque background.
+                            val (whitePercent, blackPercent) = bandPercentages(frame)
+                            assertTrue("White source band at ${time}ms: $whitePercent% white, $blackPercent% black",
+                                whitePercent < 2 && blackPercent >= 60)
                             val yellow = (frame.height * 7 / 10 until frame.height).any { y ->
                                 (0 until frame.width step 2).any { x ->
                                     val pixel = frame.getPixel(x, y)
@@ -198,6 +209,25 @@ class BilingualVideoNativeTest {
             VideoPreviewDiagnostics.onFrameForTest = null
             password.fill('\u0000')
         }
+    }
+
+    private fun bandPercentages(frame: Bitmap): Pair<Int, Int> {
+        var white = 0
+        var black = 0
+        var sampled = 0
+        // Sample across the white drawbox at (22, 470) with size 316 x 131 on the 360 x 640 source.
+        for (y in frame.height * 471 / 640 until frame.height * 600 / 640 step 3) {
+            for (x in frame.width * 23 / 360 until frame.width * 337 / 360 step 3) {
+                val pixel = frame.getPixel(x, y)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                if (minOf(r, g, b) > 170 && maxOf(r, g, b) - minOf(r, g, b) < 30) white++
+                if (maxOf(r, g, b) < 45) black++
+                sampled++
+            }
+        }
+        return (100 * white / sampled) to (100 * black / sampled)
     }
 
     /** Original review excerpts. No test name, timestamp or translation enters the app prompt code. */
