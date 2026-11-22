@@ -39,7 +39,7 @@ jobs:
           df -h "$ANDROID_AVD_HOME"
           adb start-server
           "$ANDROID_HOME/emulator/emulator" -avd bilingual -accel on -no-window -no-snapshot -no-audio -no-boot-anim \
-            -gpu swiftshader -cores 2 -memory 2048 -partition-size 2560 > "$RUNNER_TEMP/emulator.log" 2>&1 &
+            -gpu swiftshader -cores 2 -memory 3072 -partition-size 2560 > "$RUNNER_TEMP/emulator.log" 2>&1 &
           emulator_pid=$!
           deadline=$((SECONDS + 300))
           until [[ $(timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true) == 1 ]]; do

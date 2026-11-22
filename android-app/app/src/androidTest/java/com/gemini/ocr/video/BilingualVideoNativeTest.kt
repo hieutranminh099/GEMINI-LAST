@@ -95,6 +95,9 @@ class BilingualVideoNativeTest {
                 assertEquals(File(context.filesDir, "expected-model").readText(), settings.videoTextModel)
                 if (!simulate) VideoTranslationClient(context).checkModel()
             }
+            if (!sourcePhase && !simulate) {
+                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
+            }
             if (sourcePhase) File(context.filesDir, "expected-model").writeText(settings.videoTextModel)
             evidence.appendText("model=${settings.videoTextModel}\n")
             val jobs = VideoJobs.get(context)
@@ -157,16 +160,22 @@ class BilingualVideoNativeTest {
                         }
                     }
                     evidence.appendText("preview=$language\n")
+                }
+                val exportIntent = Intent(intent).putExtra("ux_step", "export")
+                ActivityScenario.launch<VideoActivity>(exportIntent).use { activity ->
+                    val result = store.load(p.id)
                     for (ass in listOf(false, true)) {
                         val download = VideoDownloads.saveSubtitle(context, result, ass)
                         assertTrue(download.name.contains("-$language-"))
                         val text = context.contentResolver.openInputStream(download.uri)!!.bufferedReader().use { it.readText() }
                         assertTrue(text.contains(result.cues.first().translation))
                     }
+                    evidence.appendText("subtitles=$language\n")
                     activity.onActivity { jobs.exportMp4(p.id) }
                     waitForJob()
                     val exported = store.load(p.id)
                     assertEquals(exported.message, VideoStage.COMPLETE, exported.stage)
+                    evidence.appendText("rendered=$language\n")
                     val mp4 = VideoDownloads.saveRenderedMp4(context, exported)
                     assertTrue(mp4.name.contains("-$language-"))
                     MediaMetadataRetriever().use { reader ->
@@ -200,8 +209,6 @@ class BilingualVideoNativeTest {
                 settings.standaloneApiKey = ""
                 assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
                 assertFalse(settings.hasGeminiVideoKey())
-            } else if (!simulate) {
-                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
             }
         } finally {
             VideoTranslationClient.overrideResponseForTest = null

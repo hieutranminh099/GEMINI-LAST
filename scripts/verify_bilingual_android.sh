@@ -53,9 +53,12 @@ for phase in source recovery; do
   fi
   adb shell am instrument -w -e bilingualProvider "$provider" -e bilingualPhase "$phase" -e class com.gemini.ocr.video.BilingualVideoNativeTest \
     "$package.test/androidx.test.runner.AndroidJUnitRunner" > "result-$phase"
-  adb exec-out run-as "$package" cat files/verification.txt 2>/dev/null | grep -E '^(drive_authorization|model|translated|preview|exported|excerpt_[a-z_]+)=[A-Za-z0-9._-]+$' || true
+  adb exec-out run-as "$package" cat files/verification.txt 2>/dev/null | grep -E '^(drive_authorization|model|translated|preview|subtitles|rendered|exported|excerpt_[a-z_]+)=[A-Za-z0-9._-]+$' || true
   if ! grep -Fq 'OK (1 test)' "result-$phase"; then
-    grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|TimeoutCancellationException|BilingualVideoNativeTest.kt:[0-9]+|FAILURES|Tests run' "result-$phase" | head -10
+    grep -E 'AssertionError|VideoApiException|Illegal(State|Argument)Exception|TimeoutCancellationException|BilingualVideoNativeTest.kt:[0-9]+|FAILURES|Tests run|INSTRUMENTATION_(FAILED|CODE|RESULT): (shortMsg=Process (crashed|died)|-?[0-9]+)' "result-$phase" | head -12 || true
+    # Only fixed diagnostic patterns, never dump this app's logs or credentials.
+    adb shell dumpsys activity exit-info "$package" 2>/dev/null | grep -oE 'reason=[0-9]+ \([A-Z _]+\)|status=[0-9]+' | head -12 || true
+    adb logcat -b crash -d 2>/dev/null | grep -oE 'Fatal signal [0-9]+ \(SIG[A-Z]+\)|java.lang.OutOfMemoryError|[A-Za-z]+Exception|#[0-9]+ pc [0-9a-f]+  /[^ ]+\.so' | tail -12 || true
     exit 1
   fi
   echo "Android integration passed: provider=$provider phase=$phase"
