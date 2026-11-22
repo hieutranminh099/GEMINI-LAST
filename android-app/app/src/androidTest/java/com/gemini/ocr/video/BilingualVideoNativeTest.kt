@@ -238,8 +238,10 @@ class BilingualVideoNativeTest {
             "刘老师！", "章强。", "你们干嘛？")
         val rows = sources.mapIndexed { i, text -> VideoCue("excerpt-$i", i * 4000L, i * 4000L + 3500, text) }
         val context = "Teacher Liu is Li Kai's mother. Classmate Zhang Qiang visits unexpectedly. " +
-            "At dinner the table already has several dishes. After dinner the visitor offers to wash the dishes. " +
-            "Zhang Qiang then mentions his father. Kai addresses his mother and his classmate in the last line. " +
+            "At dinner the table already has several dishes. At 00:40 the student is standing at the sink " +
+            "holding the used dinner plates and speaking politely to his teacher. " +
+            "Zhang Qiang then mentions his father. At 00:56 Kai opens the door. His mother and " +
+            "his classmate are the only two people he sees. He questions both of them. " +
             "Three unconfirmed OCR transcriptions of names occur. Their identities have not been verified."
         val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
         for (language in listOf("vi", "en")) {
@@ -251,13 +253,16 @@ class BilingualVideoNativeTest {
             fun checkWords(label: String, index: Int, vararg alternatives: String) {
                 val found = alternatives.any { text[index].contains(it) }
                 evidence.appendText("excerpt_${language}_$label=${if (found) "MATCH" else "REVIEW"}\n")
+                if (label == "dishes" || label == "pair") {
+                    assertTrue("Scene context required for excerpt $index ($language/$label)", found)
+                }
             }
             if (language == "vi") {
                 checkWords("target", 0, "nhắm", "để mắt", "ngắm", "để ý", "lọt vào mắt", "tăm tia", "dòm ngó")
                 checkWords("teacher", 1, "chủ nhiệm")
                 checkWords("money", 4, "tiền")
                 checkWords("host", 6, "món", "đồ ăn", "thức ăn")
-                checkWords("dishes", 10, "bát", "chén")
+                checkWords("dishes", 10, "bát", "chén", "đĩa", "dĩa")
                 checkWords("father", 11, "bố", "ba", "cha")
                 checkWords("address", 12, "cô lưu")
                 checkWords("pair", 14, "hai", "mẹ")
@@ -266,7 +271,7 @@ class BilingualVideoNativeTest {
                 checkWords("teacher", 1, "homeroom", "form teacher", "class teacher", "head teacher")
                 checkWords("money", 4, "money", "cash", "afford", "enough on me")
                 checkWords("host", 6, "dish", "food", "prepare", "special", "cook", "make much")
-                checkWords("dishes", 10, "dish", "wash up", "washing up")
+                checkWords("dishes", 10, "dish", "plate", "bowl", "wash up", "washing up", "washing-up")
                 checkWords("father", 11, "dad", "father")
                 checkWords("address", 12, "liu")
                 checkWords("pair", 14, "two", "both", "mom", "mum")
