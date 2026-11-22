@@ -97,17 +97,17 @@ class VideoCloudSync internal constructor(
     /** First interactive use can return a Google account/consent PendingIntent. Never launch from a worker. */
     suspend fun authorize(selectAccount:Boolean=true):PendingIntent?{
         try{
-            status("Đang yêu cầu Google chọn tài khoản và cấp quyền…")
+            status("Đang yêu cầu Google chọn tài khoản và cấp quyền…", needsAuth = state.value.authorizationRequired)
             val request=request(if(selectAccount)null else state.value.accountEmail)
             val result=Identity.getAuthorizationClient(context).authorize(request).await()
             if(result.hasResolution())return result.pendingIntent.also{
                 if(it==null)throw AuthorizationFailure("NO_RESOLUTION","Google không trả cửa sổ cấp quyền.")
-                status("Đang chờ bạn chọn tài khoản và cấp quyền Google Drive.")
+                status("Đang chờ bạn chọn tài khoản và cấp quyền Google Drive.", needsAuth = state.value.authorizationRequired)
             }
             accept(result)
             return null
         }catch(e:CancellationException){throw e}
-        catch(e:Exception){failAuthorization(e,"request")}
+        catch(e:Exception){failAuthorization(e,"request", cancelled = e is ApiException && e.statusCode in listOf(16,12501))}
     }
     suspend fun completeAuthorization(data:Intent?,resultCode:Int=Activity.RESULT_OK){
         try{
@@ -116,14 +116,20 @@ class VideoCloudSync internal constructor(
             if(data==null)throw AuthorizationFailure("NO_RESULT_$resultCode",
                 "Google đã đóng cửa sổ mà chưa trả kết quả cấp quyền. Hãy chọn tài khoản và thử lại.")
             val result=authorizationResultFromIntent(data)
+            if(resultCode==Activity.RESULT_CANCELED)throw AuthorizationFailure("CANCELED", "Đã hủy chọn tài khoản Google.")
             if(result.hasResolution())throw AuthorizationFailure("INCOMPLETE","Cấp quyền Google chưa hoàn tất.")
             accept(result)
         }catch(e:CancellationException){throw e}
-        catch(e:Exception){failAuthorization(e,"callback")}
+        catch(e:Exception){
+            val cancelled = resultCode == Activity.RESULT_CANCELED && (data == null ||
+                e is AuthorizationFailure && e.code == "CANCELED" || e is ApiException && e.statusCode in listOf(16,12501))
+            failAuthorization(e,"callback",cancelled)
+        }
     }
-    private fun failAuthorization(error:Exception,stage:String):Nothing{
+    private fun failAuthorization(error:Exception,stage:String,cancelled:Boolean):Nothing{
         val message=authMessage(error,stage)
-        status(message,needsAuth=true)
+        val current=state.value
+        status(message,needsAuth=!cancelled || current.accountEmail.isBlank() || current.authorizationRequired)
         throw IOException(message,error)
     }
     private suspend fun accept(result:AuthorizationResult)=acceptAuthorization(result.accessToken,result.grantedScopes)

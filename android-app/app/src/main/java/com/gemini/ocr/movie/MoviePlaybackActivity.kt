@@ -281,13 +281,14 @@ class MoviePlaybackActivity : ComponentActivity() {
                                     }
                                 }
                                 MovieCaptionDialog(edit.cue, captionText, { captionText = it }, editingBusy, captionMessage,
-                                    canRetry = settings.hasGeminiVideoKey(), canUndo = canUndo,
+                                    canRetry = settings.hasGeminiVideoKey() && ownsAccount(selection.accountEmail) &&
+                                        captionText == edit.cue.translation, canUndo = canUndo,
                                     onRetry = {
                                         editingBusy = true
                                         captionMessage = "Đang lấy gợi ý…"
                                         scope.launch {
                                             try {
-                                                val request = movieCaptionRequest(selection.project, edit.cue.id)
+                                                val request = movieCaptionRequest(selection.project, edit.cue.id, settings.videoTextModel)
                                                 val reply = VideoTranslationClient(this@MoviePlaybackActivity).translate(
                                                     settings.effectiveStandaloneApiKey(), request, settings.profile, settings.localGlossary
                                                 ) {
@@ -295,7 +296,11 @@ class MoviePlaybackActivity : ComponentActivity() {
                                                     check(!SessionState.running.value) { "Dừng Live trước khi yêu cầu dịch lại." }
                                                     check(playbackGeneration.get() == edit.generation && ownsAccount(selection.accountEmail))
                                                 }
-                                                require(caption === edit && loaded?.revision == edit.revision) { "Phụ đề đã đổi; gợi ý cũ bị bỏ qua." }
+                                                require(caption === edit && loaded?.revision == edit.revision &&
+                                                    loaded?.accountEmail == selection.accountEmail &&
+                                                    playbackGeneration.get() == edit.generation && ownsAccount(selection.accountEmail)) {
+                                                    "Phụ đề hoặc tài khoản đã đổi; gợi ý cũ bị bỏ qua."
+                                                }
                                                 captionText = requireNotNull(reply.accepted[edit.cue.id]) { "Gemini chưa trả lời cho câu này." }
                                                 captionMessage = "Xem lại gợi ý rồi bấm Lưu để áp dụng."
                                             } catch (cancel: CancellationException) { throw cancel }

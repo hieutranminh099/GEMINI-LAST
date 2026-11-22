@@ -91,7 +91,7 @@ internal class DriveVideoRepository(
             require(bytes.size<=MAX_MANIFEST){"Dự án quá lớn để sao lưu (32 MiB)."}
             val local=LocalMedia("manifest",bytes.size.toLong(),hash(bytes),"application/json"){bytes.inputStream()}
             val kind = if (project.targetLanguage != "vi" || project.otherCues.isNotEmpty()) "bilingual-manifest" else "manifest"
-            val id=upload(local,project.id,revision,project.title,project.updatedAt,media.first().size,finalKind=kind)
+            val id=upload(local,project.id,revision,project.title,project.updatedAt,media.first().size,finalKind=kind,verifyServer=true)
             CloudVideoSnapshot(id,project.id,project.title,project.updatedAt,revision,media.first().size)
         }
     }
@@ -140,7 +140,7 @@ internal class DriveVideoRepository(
             }
             onProgress("Đang tải ${episode.title.take(60)} lên Google Drive…")
             val existing=findMedia(local.sha,local.size)
-            val fileId=if(existing!=null){verifyMovieUpload(existing,local);existing}
+            val fileId=if(existing!=null){verifyDriveUpload(existing,local);existing}
                 else upload(local,movie.id,"movie",verifyServer=true)
             media.put(JSONObject().put("role","episode").put("episodeId",episode.id).put("id",fileId)
                 .put("size",local.size).put("sha256",local.sha).put("mime",local.mime))
@@ -148,7 +148,7 @@ internal class DriveVideoRepository(
         if(movie.coverPath.isNotBlank() && File(movie.coverPath).isFile) {
             val local=inspectMovieMedia(File(movie.coverPath),"image/jpeg")
             val existing=findMedia(local.sha,local.size)
-            val fileId=if(existing!=null){verifyMovieUpload(existing,local);existing}
+            val fileId=if(existing!=null){verifyDriveUpload(existing,local);existing}
                 else upload(local,movie.id,"movie",verifyServer=true)
             media.put(JSONObject().put("role","cover").put("id",fileId).put("size",local.size).put("sha256",local.sha).put("mime",local.mime))
         }
@@ -164,7 +164,7 @@ internal class DriveVideoRepository(
         // A retry after a successful publication reuses the same catalog revision.
         val previous=listFiles("appProperties has { key='kind' and value='$manifestKind' } and appProperties has { key='projectId' and value='${movie.id}' } and appProperties has { key='revision' and value='$revision' }").firstOrNull()
         if(previous!=null) {
-            val fileId=previous.getString("id");verifyMovieUpload(fileId,local);return@withContext fileId
+            val fileId=previous.getString("id");verifyDriveUpload(fileId,local);return@withContext fileId
         }
         upload(local,movie.id,revision,movie.title,movie.updatedAt,media.sumSizes(),finalKind=manifestKind,verifyServer=true)
     }
@@ -334,7 +334,16 @@ internal class DriveVideoRepository(
 
     suspend fun restore(snapshot:CloudVideoSnapshot,onProgress:(String)->Unit={}):VideoProject=withContext(Dispatchers.IO){
         validId(snapshot.fileId)
+        val manifestMetadata = jsonRequest(Request.Builder().url(api.newBuilder().addPathSegment("files")
+            .addPathSegment(snapshot.fileId).addQueryParameter("fields", "appProperties").build()).get())
+        val properties = manifestMetadata.getJSONObject("appProperties")
+        require(properties.optString("kind") in setOf("manifest", "bilingual-manifest") &&
+            properties.optString("projectId") == snapshot.projectId && properties.optString("revision") == snapshot.revisionId) {
+            "Bản sao đã thay đổi; hãy tải lại danh sách."
+        }
+        val expectedHash = properties.getString("sha256")
         val raw=downloadBytes(snapshot.fileId,MAX_MANIFEST)
+        require(hash(raw) == expectedHash) { "Kiểm tra SHA-256 của bản sao thất bại; chưa khôi phục dự án." }
         val envelope=JSONObject(raw.toString(Charsets.UTF_8))
         require(envelope.getInt("schema")==1){"Phiên bản bản sao chưa được hỗ trợ."}
         require(envelope.getString("revision")==snapshot.revisionId){"Bản sao đã thay đổi; hãy tải lại danh sách."}
@@ -454,7 +463,7 @@ internal class DriveVideoRepository(
                         withContext(NonCancellable){runCatching{delete(fileId)}}
                         throw IOException("Tệp nguồn đã thay đổi trong lúc sao lưu. Hãy thử lại; chưa tạo bản cloud.")
                     }
-                    if(verifyServer)verifyMovieUpload(fileId,local)
+                    if(verifyServer)verifyDriveUpload(fileId,local)
                     props.put("kind",finalKind)
                     jsonRequest(Request.Builder().url(api.newBuilder().addPathSegment("files").addPathSegment(fileId)
                         .addQueryParameter("fields","id").build()).patch(JSONObject().put("appProperties",props).toString().toRequestBody(JSON)))
@@ -467,12 +476,12 @@ internal class DriveVideoRepository(
         throw IOException("Upload chưa hoàn tất.")
     }
 
-    private suspend fun verifyMovieUpload(id:String,local:LocalMedia) {
+    private suspend fun verifyDriveUpload(id:String,local:LocalMedia) {
         validId(id)
         val metadata=jsonRequest(Request.Builder().url(api.newBuilder().addPathSegment("files").addPathSegment(id)
             .addQueryParameter("fields","size,sha256Checksum").build()).get())
         require(metadata.optString("size").toLongOrNull()==local.size && metadata.optString("sha256Checksum")==local.sha){
-            "Google Drive chưa xác minh đúng dung lượng/SHA-256; phim chưa được đánh dấu đã đồng bộ."
+            "Google Drive chưa xác minh đúng dung lượng/SHA-256; bản sao chưa được đánh dấu đã đồng bộ."
         }
     }
 
@@ -498,7 +507,7 @@ internal class DriveVideoRepository(
 
     private suspend fun downloadBytes(id:String,max:Int):ByteArray=read(Request.Builder().url(api.newBuilder()
         .addPathSegment("files").addPathSegment(id).addQueryParameter("alt","media").build()).get()){
-        checkResponse(it);readLimited(it,max).toByteArray(Charsets.UTF_8)
+        checkResponse(it);readLimitedBytes(it,max)
     }
     private suspend fun delete(id:String){validId(id);read(Request.Builder().url(api.newBuilder().addPathSegment("files").addPathSegment(id).build()).delete()){checkResponse(it)}}
     private suspend fun jsonRequest(builder:Request.Builder):JSONObject=read(builder){checkResponse(it);JSONObject(readLimited(it,MAX_MANIFEST))}
@@ -543,11 +552,12 @@ internal class DriveVideoRepository(
             429->"Google Drive đang giới hạn yêu cầu; sẽ thử lại sau."
             else->"Google Drive chưa hoàn tất yêu cầu (HTTP ${response.code})."})
     }
-    private fun readLimited(response:Response,max:Int):String{
+    private fun readLimited(response:Response,max:Int):String = readLimitedBytes(response,max).toString(Charsets.UTF_8)
+    private fun readLimitedBytes(response:Response,max:Int):ByteArray {
         val body=checkNotNull(response.body);require(body.contentLength()<=max || body.contentLength()==-1L)
         val out=java.io.ByteArrayOutputStream();val buffer=ByteArray(8192)
         body.byteStream().use{input->while(true){val n=input.read(buffer);if(n<0)break;require(out.size()+n<=max);out.write(buffer,0,n)}}
-        return out.toString("UTF-8")
+        return out.toByteArray()
     }
     private fun validId(id:String){require(id.matches(Regex("[a-zA-Z0-9_-]{1,200}"))){"ID cloud không hợp lệ."}}
     private fun hash(bytes:ByteArray)=MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}

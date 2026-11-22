@@ -3,6 +3,7 @@ package com.gemini.ocr.video.sync
 import android.content.Context
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.ContextWrapper
 import android.content.pm.ProviderInfo
 import android.database.Cursor
 import android.net.Uri
@@ -95,11 +96,22 @@ class DriveVideoRepositoryTest{
         val vi=project()
         val en=vi.selectTarget("en").copy(cues=vi.cues.map { it.copy(translation="Hello", approved=false) })
         val saved=repository.publish(en)
-        assertEquals(saved.fileId, repository.list().single().fileId)
-        val restored=repository.restore(saved)
+        val secondInstallFiles = File(context.cacheDir, "second-install-${UUID.randomUUID()}").apply { check(mkdir()) }
+        val secondInstall = object : ContextWrapper(context) {
+            override fun getApplicationContext(): Context = this
+            override fun getFilesDir(): File = secondInstallFiles
+        }
+        val secondStore = VideoStore(secondInstall)
+        assertTrue(secondStore.list().isEmpty())
+        val secondRepository = DriveVideoRepository(secondInstall, { "test-only-second-install-token" },
+            api=server.url("/drive/v3/"), uploadApi=server.url("/upload/drive/v3/"))
+        val listed=secondRepository.list().single()
+        assertEquals(saved.fileId, listed.fileId)
+        val restored=secondRepository.restore(listed)
         assertEquals("en",restored.targetLanguage)
         assertEquals("Hello",restored.cues.single().translation)
-        assertEquals(vi.cues,restored.selectTarget("vi").cues)
+        assertEquals(vi.cues,secondStore.load(restored.id).selectTarget("vi").cues)
+        assertEquals(vi.cues,store.load(vi.id).cues)
     }
 
     @Test fun encryptedSettingsRoundTripRequiresPasswordAndDetectsTampering()=runBlocking {
@@ -129,6 +141,36 @@ class DriveVideoRepositoryTest{
         assertEquals(before,store.list().map{it.id}.toSet())
         assertEquals(original.cues,store.load(original.id).cues)
     }
+    @Test fun modifiedManifestCannotChangeApprovedTextEvenWhenItsJsonIsValid()=runBlocking {
+        val original = project()
+        val cloud = repository.publish(original)
+        val bytes = drive.content.getValue(cloud.fileId)
+        val manifest = JSONObject(bytes.toString(Charsets.UTF_8))
+        manifest.getJSONObject("project").getJSONArray("cues").getJSONObject(0).put("translation", "Nội dung khác")
+        drive.content[cloud.fileId] = manifest.toString().toByteArray(Charsets.UTF_8)
+        val before = server.requestCount
+        try {
+            repository.restore(cloud)
+            fail("restoring modified JSON must fail")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message.orEmpty().contains("SHA-256"))
+        }
+        assertEquals(2, server.requestCount - before) // Metadata and manifest only; no download of project media.
+        assertEquals(listOf(original.id), store.list().map { it.id })
+        assertEquals(original.cues, store.load(original.id).cues)
+    }
+    @Test fun serverChecksumMismatchKeepsUploadedManifestUndiscoverable()=runBlocking {
+        val original = project()
+        drive.corruptManifestOnServer = true
+        try {
+            repository.publish(original)
+            fail("the uploaded manifest must be verified before advertising it")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message.orEmpty().contains("SHA-256"))
+        }
+        assertTrue(repository.list().isEmpty())
+        assertEquals(original.cues, store.load(original.id).cues)
+    }
     @Test fun invalidRemoteFileIdCannotBecomeARequestPath()=runBlocking{
         val count=server.requestCount
         try{repository.restore(CloudVideoSnapshot("../escape","project","x",0,"revision"));fail("must reject invalid id")}
@@ -146,6 +188,19 @@ class DriveVideoRepositoryTest{
         // The two queries list legacy and bilingual manifests independently.
         assertEquals(2,refreshes)
         assertEquals(listOf("Bearer expired-fixture","Bearer new-fixture","Bearer expired-fixture","Bearer new-fixture"),drive.authHeaders)
+    }
+    @Test fun secondUnauthorizedResponseRequiresReconnectionWithoutAnotherRefresh()=runBlocking {
+        var refreshes = 0
+        val repo = DriveVideoRepository(context, { "expired-fixture" }, api=server.url("/drive/v3/"),
+            uploadApi=server.url("/upload/drive/v3/"), refreshSyncToken = { refreshes++; "still-expired" })
+        drive.rejectAllTokens = true
+        try {
+            repo.list()
+            fail("another 401 must stop the operation")
+        } catch (_: DriveAuthorizationRequired) {
+            assertEquals(1, refreshes)
+            assertEquals(2, server.requestCount)
+        }
     }
     @Test fun providerBodyIsNotCopiedIntoTheUserFacingError()=runBlocking{
         drive.forbidden=true
@@ -201,13 +256,15 @@ class DriveVideoRepositoryTest{
         private val sessionBytes=mutableMapOf<String,Buffer>()
         val mediaContentRanges=mutableListOf<String>()
         var corruptMedia=false
+        var corruptManifestOnServer=false
         var forbidden=false
         var rejectExpired=false
+        var rejectAllTokens=false
         var failManifestStart=false
         var onMediaSessionStarted:(()->Unit)?=null
         override fun dispatch(request:RecordedRequest):MockResponse{
             authHeaders+=request.getHeader("Authorization")
-            if(rejectExpired && request.getHeader("Authorization")=="Bearer expired-fixture")
+            if(rejectAllTokens || rejectExpired && request.getHeader("Authorization")=="Bearer expired-fixture")
                 return MockResponse().setResponseCode(401)
             if(forbidden)return MockResponse().setResponseCode(403).setBody("sensitive-provider-detail")
             val url=request.requestUrl!!
@@ -249,11 +306,17 @@ class DriveVideoRepositoryTest{
                 val collected=sessionBytes.getValue(id);collected.write(request.body.readByteArray())
                 if(collected.size<total)return MockResponse().setResponseCode(308).setHeader("Range","bytes=0-${collected.size-1}")
                 sessions.remove(id);sessionBytes.remove(id)
-                metadata[id]=meta;content[id]=collected.readByteArray()
+                metadata[id]=meta;content[id]=collected.readByteArray().also {
+                    if(corruptManifestOnServer && meta.getString("name").endsWith("-manifest")) it[0]=0
+                }
                 return MockResponse().setResponseCode(201).setBody(JSONObject().put("id",id).toString())
             }
             if(request.method=="GET" && url.encodedPath.startsWith("/drive/v3/files/")){
                 val id=url.pathSegments.last();var bytes=content[id]?:return MockResponse().setResponseCode(404)
+                if(url.queryParameter("fields")=="appProperties") {
+                    val props=metadata.getValue(id).getJSONObject("appProperties")
+                    return MockResponse().setBody(JSONObject().put("appProperties",props).toString())
+                }
                 if(url.queryParameter("fields")=="size,sha256Checksum") {
                     val digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString(""){"%02x".format(it)}
                     return MockResponse().setBody(JSONObject().put("size",bytes.size).put("sha256Checksum",digest).toString())

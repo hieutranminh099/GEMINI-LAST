@@ -11,6 +11,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.gemini.ocr.BuildConfig
 import com.gemini.ocr.settings.AppSettings
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -215,8 +216,6 @@ class BilingualVideoNativeTest {
                 settings.standaloneApiKey = ""
                 assertThrows(IllegalArgumentException::class.java) { settings.restoreGemini(sealed, password) }
                 assertFalse(settings.hasGeminiVideoKey())
-            } else if (!simulate) {
-                verifyDialogueExcerpts(VideoTranslationClient(context), settings, evidence)
             }
         } finally {
             VideoTranslationClient.overrideResponseForTest = null
@@ -245,70 +244,102 @@ class BilingualVideoNativeTest {
         return (100 * white / sampled) to (100 * black / sampled)
     }
 
-    /** Original review excerpts. No test name, timestamp or translation enters the app prompt code. */
-    private suspend fun verifyDialogueExcerpts(client: VideoTranslationClient, settings: AppSettings, evidence: File) {
+    @Test fun assessDialogueExcerptsWithGemini(): Unit = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue(args.getString("bilingualPhase") == "quality")
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        require(BuildConfig.DEBUG && context.packageName == "com.gemini.ocr.bilingualtest")
+        val settings = AppSettings(context)
+        val credential = File(context.filesDir, "credential")
+        val evidence = File(context.filesDir, "verification.txt")
+        require(!settings.hasGeminiVideoKey())
+        settings.standaloneApiKey = credential.readText()
+        check(credential.delete())
+        try {
+            val supported = AppSettings.VIDEO_MODELS.any { model ->
+                settings.videoTextModel = model
+                try {
+                    VideoTranslationClient(context) { phase, value -> evidence.appendText("excerpt_$phase=$value\n") }.checkModel()
+                    true
+                } catch (error: VideoApiException) {
+                    if (error.code !in setOf("API_MODEL", "API_AUTH")) throw error
+                    false
+                }
+            }
+            check(supported) { "No configured Gemini model supports generation" }
+            evidence.appendText("model=${settings.videoTextModel}\n")
+            verifyDialogueExcerpts(context, settings, evidence)
+        } finally {
+            settings.standaloneApiKey = ""
+        }
+    }
+
+    /** Excerpt transcripts and supplied scene observations on a synthetic timeline. */
+    private suspend fun verifyDialogueExcerpts(context: android.content.Context, settings: AppSettings, evidence: File) {
         val sources = listOf("哪个又被他盯上了？", "我妈是班主任。", "我妈不让我乱说。", "凯子。",
             "强哥，我手上钱不够。", "张乔。", "都没准备什么菜。", "你妈妈是老师吗？",
             "是我让小凯别说的。", "张强。", "我帮您洗吧。", "我爸忙着挣钱，顾不上我。",
             "刘老师！", "章强。", "你们干嘛？")
-        val rows = sources.mapIndexed { i, text -> VideoCue("excerpt-$i", i * 4000L, i * 4000L + 3500, text) }
-        val context = """
+        val rows = sources.mapIndexed { i, text ->
+            val startMs = 109_000L + i * 4_000L
+            VideoCue("excerpt-$i", startMs, startMs + 3_500, text)
+        }
+        val scene = """
             Teacher Liu is Li Kai's mother. Classmate Zhang Qiang visits unexpectedly.
             Three unconfirmed OCR transcriptions of names occur. Their identities have not been verified.
-            00:24 | A meal is already laid out. The hostess welcomes her unexpected guest.
-            00:40 | At the sink, the student takes a stack of dirty plates and bowls from his teacher's hands.
-            00:44 | Zhang Qiang is speaking about his father.
-            00:56 | Kai opens the door, sees his mother and his classmate, turns to his mother and questions both people.
+            02:13 | A meal is already laid out. The hostess welcomes her unexpected guest.
+            02:29 | Speaker: the student. Listener: Teacher Liu. At the sink after the meal, the student takes dirty plates and bowls from his teacher's hands.
+            02:33 | Zhang Qiang is speaking about his father.
+            02:45 | Kai opens the door, sees his mother and his classmate, turns to his mother and questions both people.
         """.trimIndent()
-        val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.size * 4000L, context))
-        val initialModel = settings.videoTextModel
+        val batch = requireNotNull(VideoFullDialoguePlan.next(rows, rows.last().endMs, scene))
+        val serviceFailures = mutableListOf<String>()
         val unresolved = mutableListOf<String>()
         for (language in listOf("vi", "en")) {
             val request = batch.copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
-            val result = client.translate(settings.effectiveStandaloneApiKey(), request, "document", "") {}
+            suspend fun call(kind: String, group: VideoTranslationPlan.Batch): VideoTranslationClient.Result? {
+                val client = VideoTranslationClient(context) { phase, value ->
+                    evidence.appendText("excerpt_${language}_${kind}_$phase=$value\n")
+                }
+                return try {
+                    VideoRequestDeadline.run(group.usesDialogueDeadline, staged = false, economy = false) {
+                        client.translate(settings.effectiveStandaloneApiKey(), group, "document", "") {}
+                    }
+                } catch (error: VideoApiException) {
+                    evidence.appendText("excerpt_${language}_${kind}_failure=${error.code}\n")
+                    serviceFailures += "$language/$kind/${error.code}"
+                    null
+                } catch (_: TimeoutCancellationException) {
+                    evidence.appendText("excerpt_${language}_${kind}_failure=JOB_DEADLINE\n")
+                    serviceFailures += "$language/$kind/JOB_DEADLINE"
+                    null
+                }
+            }
+            val dishWords = if (language == "vi") listOf("bát", "chén", "đĩa", "dĩa") else listOf("dish", "plate", "bowl")
+            val dishesIndex = 10
+            val focused = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, dishesIndex), scene)
+                .copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
+            val focusedResult = call("dishes_focused", focused)
+            if (focusedResult != null) {
+                val translated = normalized(focusedResult.accepted.getValue(rows[dishesIndex].id))
+                val matched = dishWords.any(translated::contains)
+                evidence.appendText("excerpt_${language}_dishes_focused=${if (matched) "MATCH" else "REVIEW"}\n")
+                if (!matched) unresolved += "$language/dishes_focused"
+            }
+            val result = call("group", request) ?: continue
             assertEquals(request.cueIds, result.accepted.keys.toList())
-            val text = rows.map { java.text.Normalizer.normalize(result.accepted.getValue(it.id), java.text.Normalizer.Form.NFC).lowercase() }
-            // These checks cover explicit lexical evidence. Subtle pronouns need the original scene.
-            suspend fun checkWords(label: String, index: Int, vararg alternatives: String) {
+            val text = rows.map { normalized(result.accepted.getValue(it.id)) }
+            fun checkWords(label: String, index: Int, vararg alternatives: String) {
                 val found = alternatives.any { text[index].contains(it) }
                 evidence.appendText("excerpt_${language}_$label=${if (found) "MATCH" else "REVIEW"}\n")
-                if (!found && label in setOf("dishes", "pair")) {
-                    // Exercise the same explicit model selection and single-cue request used
-                    // when the reviewer asks for a second translation of an ambiguous line.
-                    val retryModel = AppSettings.VIDEO_FLASH_MODEL
-                    evidence.appendText("excerpt_${language}_${label}_model=$retryModel\n")
-                    val retry = try {
-                        settings.videoTextModel = retryModel
-                        client.checkModel()
-                        val single = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, index), context)
-                            .copy(targetLanguage = language, requestModel = settings.videoTextModel, strictDialogue = true)
-                        VideoRequestDeadline.run(single.usesDialogueDeadline, staged = false, economy = false) {
-                            client.translate(settings.effectiveStandaloneApiKey(), single, "document", "") {}
-                        }
-                    } catch (error: VideoApiException) {
-                        evidence.appendText("excerpt_${language}_${label}_retry=${error.code}\n")
-                        unresolved += "$language/$label/${error.code}"
-                        return
-                    } catch (error: kotlinx.coroutines.TimeoutCancellationException) {
-                        evidence.appendText("excerpt_${language}_${label}_retry=TIMEOUT\n")
-                        unresolved += "$language/$label/TIMEOUT"
-                        return
-                    } finally {
-                        settings.videoTextModel = initialModel
-                    }
-                    val revised = java.text.Normalizer.normalize(retry.accepted.getValue(rows[index].id),
-                        java.text.Normalizer.Form.NFC).lowercase()
-                    val corrected = alternatives.any(revised::contains)
-                    evidence.appendText("excerpt_${language}_${label}_retry=${if (corrected) "MATCH" else "REVIEW"}\n")
-                    if (!corrected) unresolved += "$language/$label"
-                }
+                if (!found) unresolved += "$language/$label"
             }
             if (language == "vi") {
                 checkWords("target", 0, "nhắm", "để mắt", "ngắm", "để ý", "lọt vào mắt", "tăm tia", "dòm ngó")
                 checkWords("teacher", 1, "chủ nhiệm")
                 checkWords("money", 4, "tiền")
                 checkWords("host", 6, "món", "đồ ăn", "thức ăn")
-                checkWords("dishes", 10, "bát", "chén", "đĩa", "dĩa")
+                checkWords("dishes", dishesIndex, *dishWords.toTypedArray())
                 checkWords("father", 11, "bố", "ba", "cha")
                 checkWords("address", 12, "cô lưu")
                 checkWords("pair", 14, "hai", "mẹ")
@@ -317,7 +348,7 @@ class BilingualVideoNativeTest {
                 checkWords("teacher", 1, "homeroom", "form teacher", "class teacher", "head teacher")
                 checkWords("money", 4, "money", "cash", "afford", "enough on me")
                 checkWords("host", 6, "dish", "food", "prepare", "special", "cook", "make much")
-                checkWords("dishes", 10, "dish", "plate", "bowl", "wash up", "washing up", "washing-up")
+                checkWords("dishes", dishesIndex, *dishWords.toTypedArray())
                 checkWords("father", 11, "dad", "father")
                 checkWords("address", 12, "liu")
                 checkWords("pair", 14, "two", "both", "mom", "mum")
@@ -325,6 +356,10 @@ class BilingualVideoNativeTest {
             assertFalse("A second teacher was invented", listOf("đinh", "ding").any { text[12].contains(it) })
             evidence.appendText("excerpt_rows_$language=${text.size}\n")
         }
-        assertTrue("Unresolved contextual references: $unresolved", unresolved.isEmpty())
+        assertTrue("Gemini service failures: $serviceFailures. Contextual references for review: $unresolved",
+            serviceFailures.isEmpty() && unresolved.isEmpty())
     }
+
+    private fun normalized(text: String) =
+        java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFC).lowercase(java.util.Locale.ROOT)
 }

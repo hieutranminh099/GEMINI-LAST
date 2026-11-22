@@ -2,10 +2,12 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from app import provider as provider_module
 from app.manager import TranslationManager
 from app.provider import (GeminiProvider, ProviderRouter, TranslationError, api_generation_config,
                           api_system, retry_delay_ms, translation_system)
@@ -112,9 +114,11 @@ async def test_fast_wrong_translation_count_remains_invalid():
         await provider.close()
 
 
-async def test_quota_cooldown_blocks_http_but_replacement_key_resets_it():
+async def test_quota_cooldown_blocks_http_but_replacement_key_resets_it(monkeypatch):
     calls = []
     key = ['offline-key-one']
+    now = [42.0]
+    monkeypatch.setattr(provider_module, 'time', SimpleNamespace(monotonic=lambda: now[0]))
 
     def handler(request):
         calls.append(1)
@@ -128,9 +132,10 @@ async def test_quota_cooldown_blocks_http_but_replacement_key_resets_it():
         with pytest.raises(TranslationError) as first:
             await provider.translate(['你好'], **kwargs)
         assert first.value.retry_after_ms == 30000
+        now[0] += .25
         with pytest.raises(TranslationError) as blocked:
             await provider.translate(['再见'], **kwargs)
-        assert 29000 <= blocked.value.retry_after_ms <= 30000
+        assert blocked.value.retry_after_ms == 29750
         assert len(calls) == 1
         key[0] = 'offline-key-two'
         assert provider.availability_error() is None

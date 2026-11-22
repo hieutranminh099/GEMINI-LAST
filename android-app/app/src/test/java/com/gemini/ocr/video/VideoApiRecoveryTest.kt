@@ -185,6 +185,33 @@ class VideoApiRecoveryTest {
         assertEquals(3, requests)
     }
 
+    @Test fun focusedRequestRetriesTransientFailureOnceAndPreservesLongProviderCooldown() = runBlocking {
+        var requests = 0
+        val waits = mutableListOf<Long>()
+        val exhausted = try {
+            VideoApiRecovery.run(beforeDispatch = {}, dispatchTurn = {}, sleep = { waits += it }, jitter = { 0 },
+                retryPolicy = VideoApiRetryPolicy.FOCUSED) {
+                requests++
+                throw SocketTimeoutException("private details")
+            }
+        } catch (error: VideoApiException) { error }
+        assertEquals("API_TIMEOUT", exhausted.code)
+        assertEquals(2, requests)
+        assertEquals(listOf(1_000L), waits)
+
+        val start = System.currentTimeMillis()
+        val checkpoint = mutableListOf<Long>()
+        val deferred = try {
+            VideoApiRecovery.run(beforeDispatch = {}, dispatchTurn = {}, sleep = { fail("must defer long waits") },
+                onRetry = { _, retryAt, _ -> checkpoint += retryAt }, retryPolicy = VideoApiRetryPolicy.FOCUSED) {
+                throw VideoApiRecovery.httpFailure(503, retryAfter = "60")
+            }
+        } catch (error: VideoApiException) { error }
+        assertEquals("API_SERVICE_503", deferred.code)
+        assertEquals(checkpoint.single(), deferred.nextRetryAt)
+        assertTrue(deferred.nextRetryAt >= start + 60_000)
+    }
+
     @Test fun authAndTrueDailyQuotaNeverRetry() = runBlocking {
         val body = JSONObject().put("error", JSONObject().put("details", JSONArray().put(JSONObject()
             .put("@type", "type.googleapis.com/google.rpc.QuotaFailure")

@@ -116,9 +116,9 @@ class VideoDialogueQualityRequestTest {
 
     @Test fun promptRevisionInvalidatesOldPrivateCacheEntriesAndIsPresentInTheActualRequest(){
         val batch=plan();val current=JSONObject(batch.videoContext)
-        assertEquals("video-dialogue-quality-v5",VideoDialoguePrompt.REVISION)
+        assertEquals("video-dialogue-quality-v6",VideoDialoguePrompt.REVISION)
         assertEquals(VideoDialoguePrompt.REVISION,current.getString("promptRevision"))
-        val old=JSONObject(batch.videoContext).put("promptRevision", "video-dialogue-quality-v4")
+        val old=JSONObject(batch.videoContext).put("promptRevision", "video-dialogue-quality-v5")
         val scope="controlled-private-batch-scope"
         assertNotEquals(BatchTranslationCache.key(scope,old.toString()),BatchTranslationCache.key(scope,batch.videoContext))
         assertEquals(VideoDialoguePrompt.REVISION,data(request(batch)).getString("promptRevision"))
@@ -139,6 +139,96 @@ class VideoDialogueQualityRequestTest {
         assertEquals(original.map{Triple(it.id,it.startMs,it.endMs)},updated.map{Triple(it.id,it.startMs,it.endMs)})
         assertEquals(original.map{it.source},updated.map{it.source})
         assertNull(VideoFullDialoguePlan.next(updated,3800))
+    }
+
+    @Test fun bothLanguagesBindObservationsToTheirCueAndKeepDistinctNamesAndFragments() {
+        val rows = listOf(
+            VideoCue("earlier", 60_000, 61_000, "章强。", approved = true, translation = "Chương Cường."),
+            VideoCue("first-name", 145_000, 146_000, "张乔。", qualityFlags = listOf("OCR_UNCERTAIN")),
+            VideoCue("second-name", 146_000, 147_000, "张强。", ocrConfidence = .62f),
+            VideoCue("passive", 147_000, 148_000, "又被他盯上了。"),
+            VideoCue("wash", 149_000, 150_000, "我帮您洗吧。"),
+            VideoCue("split-1", 150_000, 151_000, "我妈妈是"),
+            VideoCue("split-2", 151_000, 152_000, "班主任。")
+        )
+        val film = """
+            The mother is a teacher. Zhang's identity is unverified.
+            01:00 | A conversation in another room.
+            02:28.990 | This moment is between subtitles.
+            02:29 | The student takes the dirty bowls from the teacher.
+            02:29.500 | The student is speaking to the teacher.
+            02:30 | The next utterance is from a different speaker.
+        """.trimIndent()
+        val pending = VideoFullDialoguePlan.next(rows, 152_000, film)!!
+        val single = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, 4), film)
+        for (language in listOf("vi", "en")) {
+            val full = data(request(pending.copy(targetLanguage = language, strictDialogue = true)))
+            val window = data(request(single.copy(targetLanguage = language, strictDialogue = true)))
+            fun byStart(context: JSONObject): Map<Long, JSONObject> {
+                val dialogue = context.getJSONArray("dialogue")
+                return (0 until dialogue.length()).map(dialogue::getJSONObject).associateBy { it.getLong("startMs") }
+            }
+            for (context in listOf(full, window)) {
+                val dialogue = byStart(context)
+                assertEquals("The mother is a teacher. Zhang's identity is unverified.", context.getString("filmContext"))
+                assertFalse(context.toString().contains("between subtitles"))
+                assertEquals("张乔。", dialogue.getValue(145_000).getString("source"))
+                assertEquals("张强。", dialogue.getValue(146_000).getString("source"))
+                assertTrue(dialogue.getValue(145_000).getBoolean("uncertainSource"))
+                assertTrue(dialogue.getValue(146_000).getBoolean("uncertainSource"))
+                assertFalse(dialogue.getValue(147_000).has("sceneNote"))
+                val wash = dialogue.getValue(149_000)
+                val observations = wash.getJSONArray("sceneNote")
+                assertEquals("wash", wash.getString("id"))
+                assertEquals("The student takes the dirty bowls from the teacher.", observations.getString(0))
+                assertEquals("The student is speaking to the teacher.", observations.getString(1))
+                assertEquals("The next utterance is from a different speaker.", dialogue.getValue(150_000).getString("sceneNote"))
+                assertEquals("我妈妈是", dialogue.getValue(150_000).getString("source"))
+                assertEquals("班主任。", dialogue.getValue(151_000).getString("source"))
+            }
+            assertEquals("章强。", byStart(full).getValue(60_000).getString("source"))
+            assertFalse(window.toString().contains("another room"))
+            assertEquals("wash", window.getJSONArray("targetIds").getString(0))
+            val prompt = system(request(single.copy(targetLanguage = language, strictDialogue = true)))
+            val constraints = if (language == "vi") listOf("đúng chữ Hán", "câu bị động", "ID và mốc thời gian riêng")
+                else listOf("exact Chinese spelling", "passive clauses", "its own ID and timing")
+            assertTrue(constraints.all(prompt::contains))
+        }
+    }
+
+    @Test fun resolvedSourceIsRequiredOnlyForTheFocusedCueAndNeverChangesTheSource() {
+        val rows = listOf(VideoCue("focus", 149_000, 150_000, "我帮您洗吧。"), VideoCue("neighbor", 150_000, 151_000, "谢谢。"))
+        val film = "02:29 | The student takes dirty dishes from the teacher."
+        for ((language, translation) in listOf("vi" to "Để em rửa bát giúp cô ạ.", "en" to "Let me help you wash the dishes.")) {
+            val batch = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, 0), film)
+                .copy(targetLanguage = language, strictDialogue = true)
+            val item = request(batch).getJSONObject("generationConfig").getJSONObject("responseSchema").getJSONObject("properties")
+                .getJSONObject("translations").getJSONObject("items")
+            assertTrue(item.getJSONObject("properties").has("resolvedSource"))
+            val neighbor = VideoStagedPipeline.withContext(VideoTranslationPlan.forCue(rows, 1), film)
+                .copy(targetLanguage = language, strictDialogue = true)
+            val neighborItems = request(neighbor).getJSONObject("generationConfig").getJSONObject("responseSchema").getJSONObject("properties")
+                .getJSONObject("translations").getJSONObject("items")
+            assertFalse(neighborItems.getJSONObject("properties").has("resolvedSource"))
+            fun response(expanded: Any?): String {
+                val row = JSONObject().put("id", "focus").put("translation", translation).putOpt("resolvedSource", expanded)
+                val text = JSONObject().put("translations", JSONArray().put(row)).toString()
+                val content = JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))
+                return JSONObject().put("candidates", JSONArray().put(JSONObject().put("content", content))).toString()
+            }
+            for (invalid in listOf(null, "", 42)) {
+                val failure = assertThrows(VideoApiException::class.java) {
+                    VideoTranslationClient.parseResponse(response(invalid), batch, "", "fixture")
+                }
+                assertEquals("TEXT_INCOMPLETE_RESPONSE", failure.code)
+            }
+            val accepted = VideoTranslationClient.parseResponse(response("我帮您洗碗吧。"), batch, "", "fixture")
+            assertEquals(mapOf("focus" to translation), accepted.accepted)
+            val updated = VideoTranslationPlan.applyCloudResult(rows, batch, accepted.accepted.values.toList(), "fixture", false)
+            assertEquals(rows[0].source, updated[0].source)
+            assertEquals(rows[1], updated[1])
+            assertFalse(updated[0].json().has("resolvedSource"))
+        }
     }
 
     @Test fun nonFullVideoRequestRetainsTheExactLegacySystemContentsAndGenerationConfiguration(){

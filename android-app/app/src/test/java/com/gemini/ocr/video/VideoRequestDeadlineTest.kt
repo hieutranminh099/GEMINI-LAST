@@ -105,4 +105,14 @@ class VideoRequestDeadlineTest {
         assertEquals(240_000, client.readTimeoutMillis)
         assertEquals(60_000, client.writeTimeoutMillis)
     }
+
+    @Test fun focusedDialogueHasTimeForItsBoundedAttemptAndBackoffBudget() {
+        val client = VideoTranslationClient.requestClient(fullDialogue = true, focused = true)
+        val policy = VideoApiRetryPolicy.FOCUSED
+        assertEquals(45_000, client.callTimeoutMillis)
+        assertFalse(client.retryOnConnectionFailure)
+        assertTrue(policy.maxAttempts * client.callTimeoutMillis + policy.maxWaitMs <
+            VideoTranslationClient.FOCUSED_REQUEST_TIMEOUT_MS)
+        assertTrue(VideoTranslationClient.FOCUSED_REQUEST_TIMEOUT_MS < VideoFullDialoguePlan.REQUEST_TIMEOUT_MS)
+    }
 }

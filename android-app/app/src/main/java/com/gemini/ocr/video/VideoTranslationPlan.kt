@@ -132,13 +132,14 @@ object VideoTranslationPlan {
             return chosen.sorted()
         }
         val before=select(previous,true);val between=select(inside);val after=select(following)
+        fun sourceEvidence(cue:VideoCue)=if(VideoDialoguePrompt.uncertainSource(cue)) ",\"uncertainSource\":true" else ""
         fun contextRows(indices:List<Int>)=indices.joinToString(",",prefix="[",postfix="]"){index->
             val cue=cues[index]
-            "{\"index\":$index,\"startMs\":${cue.startMs},\"endMs\":${cue.endMs},\"source\":${quote(cue.source)},\"vietnamese\":${quote(cue.translation)},\"approved\":${cue.approved}}"
+            "{\"index\":$index,\"startMs\":${cue.startMs},\"endMs\":${cue.endMs},\"source\":${quote(cue.source)},\"vietnamese\":${quote(cue.translation)},\"approved\":${cue.approved}${sourceEvidence(cue)}}"
         }
         val targets=rows.mapIndexed{i,cue->
             val draft=if(hybrid)cue.localDraft.ifBlank{cue.translation} else ""
-            "{\"index\":${indices[i]},\"startMs\":${cue.startMs},\"endMs\":${cue.endMs},\"source\":${quote(cue.source)},\"localDraft\":${quote(draft)},\"qualityIssue\":${quote(cue.error)}}"
+            "{\"index\":${indices[i]},\"startMs\":${cue.startMs},\"endMs\":${cue.endMs},\"source\":${quote(cue.source)},\"localDraft\":${quote(draft)},\"qualityIssue\":${quote(cue.error)}${sourceEvidence(cue)}}"
         }.joinToString(",",prefix="[",postfix="]")
         val context="{\"schema\":1,\"task\":${quote(if(hybrid)"refine_local_draft_from_original_chinese" else "translate_original_chinese")},\"previous\":${contextRows(before)},\"inside\":${contextRows(between)},\"following\":${contextRows(after)},\"targets\":$targets}"
         require(context.length<=24_000){"Ngữ cảnh video quá lớn; hãy chia câu."}

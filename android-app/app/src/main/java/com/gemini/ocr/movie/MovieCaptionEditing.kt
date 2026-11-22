@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.gemini.ocr.video.VideoCue
 import com.gemini.ocr.video.VideoProject
+import com.gemini.ocr.video.VideoStagedPipeline
 import com.gemini.ocr.video.VideoTranslationPlan
 import org.json.JSONObject
 
@@ -54,13 +55,12 @@ internal fun reviseMovieCaption(
         captionUndo = if (editedText == null) null else MovieCaptionUndo(revised.revision, previous))
 }
 
-internal fun movieCaptionRequest(project: VideoProject, cueId: String): VideoTranslationPlan.Batch {
-    val targets = project.cues.map { cue ->
-        if (cue.id == cueId) cue.copy(translation = "", approved = false, model = "", error = "") else cue
-    }
-    val batch = requireNotNull(VideoTranslationPlan.nextCloudBatch(targets, hybrid = false, maxCues = 1))
-    require(batch.cueIds == listOf(cueId))
-    return batch
+internal fun movieCaptionRequest(project: VideoProject, cueId: String, requestModel: String): VideoTranslationPlan.Batch {
+    val index = project.cues.indexOfFirst { it.id == cueId }
+    require(index >= 0) { "Câu này không còn trong phụ đề." }
+    val batch = VideoTranslationPlan.forCue(project.cues, index)
+    return VideoStagedPipeline.withContext(batch, project.dialogueContext)
+        .copy(targetLanguage = project.targetLanguage, requestModel = requestModel, strictDialogue = true)
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -74,7 +74,7 @@ internal fun MovieCaptionDialog(cue: VideoCue, text: String, onText: (String) ->
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${cue.startMs}–${cue.endMs} ms", style = MaterialTheme.typography.labelMedium)
             Text(cue.source, style = MaterialTheme.typography.bodyLarge)
-            OutlinedTextField(text, onText, label = { Text("Bản dịch tiếng Việt") }, enabled = !busy,
+            OutlinedTextField(text, onText, label = { Text("Bản dịch") }, enabled = !busy,
                 modifier = Modifier.fillMaxWidth(), minLines = 2)
             if (canRetry || canUndo) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (canRetry) TextButton(onClick = onRetry, enabled = !busy) { Text("Gợi ý lại bằng Gemini") }
