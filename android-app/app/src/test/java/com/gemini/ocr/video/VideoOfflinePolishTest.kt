@@ -85,11 +85,17 @@ class VideoOfflinePolishTest {
     @Test fun quotaFailureAllowsOfflineFinishAndRetainsCooldownWhenReenabled() = runBlocking {
         val original = project(VideoPolishPolicy.ALL)
         withFixture(original) { store, jobs, owner ->
-            val retryAt = System.currentTimeMillis() + 60_000
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            context.getSharedPreferences("settings", Context.MODE_PRIVATE).edit()
+                .putString("standalone_api_key", "synthetic-invalid-ciphertext")
+                .putString("standalone_api_key_plain_fallback", "fixture-no-network").commit()
+            val now = System.currentTimeMillis()
+            val retryAt = now + 60_000
+            VideoGeminiAccounts.overrideBatchQuotaForTest = VideoBatchGeminiQuota(clockMs = { now }, awaitTurn = {})
             var requests = 0
-            VideoPolishClient.overrideResponseForTest = {
+            VideoPolishClient.overrideBatchExchangeForTest = {
                 requests++
-                throw VideoApiException("API_RATE_LIMIT", transient = true, nextRetryAt = retryAt, detail = "Chờ hạn mức.")
+                throw VideoApiRecovery.httpFailure(429, retryAfter = "60", nowMs = now, batchQuota = true)
             }
             val limited = jobs.runStageForBatch(owner, original.id, BatchPipelineStage.POLISH)
             assertEquals(retryAt, limited.pipeline.task(BatchPipelineStage.POLISH).nextRetryAt)
@@ -108,6 +114,7 @@ class VideoOfflinePolishTest {
             store.save(offline.withOfflinePolishPolicy(VideoPolishPolicy.ALL))
             val waiting = jobs.runStageForBatch(owner, original.id, BatchPipelineStage.POLISH)
             assertEquals("API_RATE_LIMIT", waiting.pipeline.task(BatchPipelineStage.POLISH).errorCode)
+            assertTrue(waiting.pipeline.task(BatchPipelineStage.POLISH).lastApiFailure?.fromSavedFailure == true)
             assertEquals(1, requests)
         }
     }
@@ -166,6 +173,8 @@ class VideoOfflinePolishTest {
         val previousLive = SessionState.running.value
         val previousNetworkHook = StandaloneTranslator.beforeNetworkCallForTest
         val previousResponse = VideoPolishClient.overrideResponseForTest
+        val previousExchange = VideoPolishClient.overrideBatchExchangeForTest
+        val previousQuota = VideoGeminiAccounts.overrideBatchQuotaForTest
         SessionState.running.value = false
         StandaloneTranslator.beforeNetworkCallForTest = { error("Unexpected external request in test") }
         jobs.reserveBatch(owner)
@@ -175,6 +184,8 @@ class VideoOfflinePolishTest {
             SessionState.running.value = previousLive
             StandaloneTranslator.beforeNetworkCallForTest = previousNetworkHook
             VideoPolishClient.overrideResponseForTest = previousResponse
+            VideoPolishClient.overrideBatchExchangeForTest = previousExchange
+            VideoGeminiAccounts.overrideBatchQuotaForTest = previousQuota
         }
     }
 

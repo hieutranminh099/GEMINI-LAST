@@ -7,18 +7,39 @@ enum class BatchPipelineStage(val label: String) {
     EXTRACT("Trích xuất"), CLEAN("Đối chiếu"), TRANSLATE("Dịch"), POLISH("Hiệu đính"), FINISH("Hoàn thiện")
 }
 
+/** Sanitized metadata for the last observed API failure. Older checkpoints omit it. */
+data class VideoApiFailureCheckpoint(
+    val code: String, val failedAtMs: Long, val httpStatus: Int?, val quotaKind: String?,
+    val fromSavedFailure: Boolean
+) {
+    internal fun json() = JSONObject().put("code", code).put("failedAtMs", failedAtMs)
+        .put("httpStatus", httpStatus).put("quotaKind", quotaKind).put("fromSavedFailure", fromSavedFailure)
+
+    companion object {
+        internal fun from(json: JSONObject) = VideoApiFailureCheckpoint(
+            json.optString("code"), json.optLong("failedAtMs").coerceAtLeast(0),
+            json.optInt("httpStatus").takeIf { it in 400..599 },
+            json.optString("quotaKind").takeIf { it in setOf("UNKNOWN", "SHORT_WINDOW", "DAILY", "ZERO") },
+            json.optBoolean("fromSavedFailure")
+        )
+    }
+}
+
 data class VideoStageCheckpoint(
     val status: String = "PENDING", val lastCheckpoint: Long = 0, val attempts: Int = 0,
     val errorCode: String = "", val nextRetryAt: Long = 0,
-    val targetCueLimit: Int = 0
+    val targetCueLimit: Int = 0, val lastApiFailure: VideoApiFailureCheckpoint? = null
 ) {
     fun json() = JSONObject().put("status",status).put("lastCheckpoint",lastCheckpoint).put("attempts",attempts)
         .put("errorCode",errorCode).put("nextRetryAt",nextRetryAt)
-        .apply { if (targetCueLimit > 0) put("targetCueLimit", targetCueLimit) }
+        .apply {
+            if (targetCueLimit > 0) put("targetCueLimit", targetCueLimit)
+            lastApiFailure?.let { put("lastApiFailure", it.json()) }
+        }
     companion object {
         fun from(j: JSONObject) = VideoStageCheckpoint(j.optString("status","PENDING"),j.optLong("lastCheckpoint"),
             j.optInt("attempts"),j.optString("errorCode"),j.optLong("nextRetryAt"),
-            j.optInt("targetCueLimit").coerceAtLeast(0))
+            j.optInt("targetCueLimit").coerceAtLeast(0), j.optJSONObject("lastApiFailure")?.let(VideoApiFailureCheckpoint::from))
     }
 }
 
@@ -33,6 +54,14 @@ data class VideoPipelineCheckpoint(
         val old=task(stage)
         return copy(version=1,currentStage=stage,stages=stages+(stage to old.copy(status=status,
             lastCheckpoint=checkpoint,attempts=old.attempts+if(status=="RUNNING")1 else 0,errorCode=errorCode,nextRetryAt=nextRetryAt)))
+    }
+    internal fun record(stage: BatchPipelineStage, status: String, checkpoint: Long = 0,
+        errorCode: String = "", nextRetryAt: Long = 0, apiFailure: VideoApiException?): VideoPipelineCheckpoint {
+        val next = record(stage, status, checkpoint, errorCode, nextRetryAt)
+        if (apiFailure == null || (apiFailure.failedAtMs == 0L && apiFailure.httpStatus == null)) return next
+        val failure = VideoApiFailureCheckpoint(apiFailure.code, apiFailure.failedAtMs, apiFailure.httpStatus,
+            apiFailure.quotaKind?.name, apiFailure.fromSavedFailure)
+        return next.copy(stages = next.stages + (stage to next.task(stage).copy(lastApiFailure = failure)))
     }
     fun invalidateFrom(stage: BatchPipelineStage) = copy(stages=stages.filterKeys{it.ordinal<stage.ordinal},currentStage=stage)
     fun json() = JSONObject().put("version",version).put("currentStage",currentStage.name)

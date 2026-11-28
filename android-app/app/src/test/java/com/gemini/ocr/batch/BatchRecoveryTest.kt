@@ -19,6 +19,8 @@ class BatchRecoveryTest {
     @Test fun deadlineRespectsProviderAndRejectsLongCooldown() {
         val batch = project("API_RATE_LIMIT")
         assertEquals(now + 60_000, BatchRecovery.nextAttemptAt(batch, now))
+        assertEquals(now + 7_250, BatchRecovery.nextAttemptAt(batch.copy(retryAfterMs = now + 7_250), now))
+        assertEquals(now, BatchRecovery.nextAttemptAt(batch.copy(retryAfterMs = now - 1), now))
         assertEquals(now + 100_000, BatchRecovery.nextAttemptAt(batch.copy(retryAfterMs = now + 100_000), now))
         assertNull(BatchRecovery.nextAttemptAt(batch.copy(retryAfterMs = now + 310_000), now))
     }

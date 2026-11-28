@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.gemini.ocr.SessionState
 import com.gemini.ocr.network.StandaloneTranslator
+import com.gemini.ocr.settings.GeminiKeyMode
 import com.gemini.ocr.video.*
 import kotlinx.coroutines.*
 import org.json.JSONArray
@@ -25,6 +26,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** Real BatchJobs + VideoJobs + AtomicFile checkpoints. Synthetic media/text responses only. */
 @RunWith(RobolectricTestRunner::class)
@@ -51,8 +53,7 @@ class BatchEpisodeIntegrationTest {
 
     @After fun restoreNetworkGuard() { StandaloneTranslator.beforeNetworkCallForTest = previousNetworkGuard }
 
-    private fun project(index: Int, pending: Int = 1): VideoProject {
-        val id = UUID.randomUUID().toString()
+    private fun project(index: Int, pending: Int = 1, id: String = UUID.randomUUID().toString()): VideoProject {
         val protected = VideoCue("$id-user", 10, 700, "原来的名字", "Tên tôi đã sửa",
             model = "user-edited")
         val cues = listOf(protected) + List(pending) { i ->
@@ -73,9 +74,9 @@ class BatchEpisodeIntegrationTest {
             }))
     }
 
-    private fun reply(ids: List<String>): String {
+    private fun reply(ids: List<String>, translation: (String) -> String = { "Bản dịch hợp lệ" }): String {
         val text = JSONObject().put("translations", JSONArray(ids.map {
-            JSONObject().put("id", it).put("translation", "Bản dịch hợp lệ")
+            JSONObject().put("id", it).put("translation", translation(it))
         })).toString()
         return JSONObject().put("candidates", JSONArray().put(JSONObject().put("finishReason", "STOP")
             .put("content", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))))).toString()
@@ -289,8 +290,8 @@ class BatchEpisodeIntegrationTest {
     @Test fun transientNetworkFailureRetriesPendingIdsWithoutLosingTheOtherEpisodes() = runBlocking {
         val originals = (1..10).map { project(it) }
         val b = batchStore.save(batch(originals).copy(autoRetryEnabled = true))
-        var waits = 0
-        val jobs = BatchJobs(context, VideoJobs(context), waitBeforeRetry = { waits++ })
+        val clock = FakeClock()
+        val jobs = BatchJobs(context, VideoJobs(context), waitBeforeRetry = clock::pauseForRetry, nowMs = clock::read)
         val done = CompletableDeferred<Unit>()
         val calls = AtomicInteger()
         val previous = VideoTranslationClient.overrideResponseForTest
@@ -302,7 +303,7 @@ class BatchEpisodeIntegrationTest {
             jobs.start(b.id); jobs.execute(b.id) { done.complete(Unit) }
             withTimeout(20_000) { done.await() }
             assertEquals("REVIEW", batchStore.load(b.id).state)
-            assertEquals(1, waits)
+            assertEquals(listOf(BatchRecovery.INTERVAL_MS), clock.waits)
             assertEquals(11, calls.get())
             originals.forEach { assertEquals(it.cues.first(), videoStore.load(it.id).cues.first()) }
         } finally {
@@ -342,5 +343,313 @@ class BatchEpisodeIntegrationTest {
             withTimeout(3_000) { while (BatchPlaybackPriority.current.restricted()) delay(20) }
             VideoTranslationClient.overrideResponseForTest = previous
         }
+    }
+
+    @Test fun longOcrFilmPersistsPartialIdsAndResumesTheDurableTimeline() = runBlocking {
+        val seed = project(1)
+        val duration = 79 * 60_000L
+        val cues = List(8_866) { index ->
+            val start = duration * index / 8_866
+            val source = "这是第${index + 1}句台词。" + if (index < 16) "他们正在讨论。".repeat(65) else ""
+            VideoCue("ocr-${index + 1}", start, start + 450, source, origin = "OCR",
+                rawZh = source, correctedZh = source, ocrConfidence = .95f)
+        }
+        fun translation(id: String) = "Bản dịch câu ${id.substringAfterLast('-')}"
+        val original = videoStore.save(seed.copy(durationMs = duration, scanMs = duration, cues = cues,
+            sourceMode = VideoSourceMode.OCR, translationMode = VideoTranslationMode.HYBRID))
+        val b = batchStore.save(batch(listOf(original)).copy(
+            translationMode = original.translationMode, sourceMode = original.sourceMode))
+        val legacy = requireNotNull(VideoFullDialoguePlan.next(cues, duration, original.pipeline.contextProfile,
+            VideoHybridRecovery.INITIAL_TARGETS) { candidate ->
+            runCatching { VideoTranslationClient.buildRequest(candidate, original.profile, original.glossary) }.isSuccess
+        })
+        val legacyPayload = VideoTranslationClient.buildRequest(legacy, original.profile, original.glossary)
+        val legacyRows = JSONObject(legacy.videoContext).getJSONArray("dialogue").length()
+        val legacyInput = VideoBatchRequestBudget.estimateInputTokens(legacyPayload)
+        assertTrue(legacyInput > VideoBatchRequestBudget.MAX_INPUT_TOKENS)
+        println("Legacy first request on the same fixture: ${legacy.cueIds.size} targets, $legacyRows dialogue rows, " +
+            "${legacyPayload.toByteArray(Charsets.UTF_8).size} bytes, $legacyInput estimated input tokens, " +
+            "${legacy.maxOutputTokens} configured max output tokens")
+        val previous = VideoTranslationClient.overrideResponseForTest
+        val requested = mutableListOf<List<String>>()
+        val clock = FakeClock()
+        fun jobs() = BatchJobs(context, VideoJobs(context), waitBeforeRetry = clock::pauseForRetry, nowMs = clock::read)
+        val maxTargets = AtomicInteger()
+        val maxTokens = AtomicInteger()
+        val maxContext = AtomicInteger()
+        fun observe(request: VideoTranslationPlan.Batch) {
+            assertTrue(request.fullDialogue)
+            assertTrue(request.cueIds.size in 1..VideoHybridRecovery.MAX_TARGETS)
+            assertTrue(request.maxOutputTokens <= VideoBatchRequestBudget.MAX_OUTPUT_TOKENS)
+            val payload = VideoTranslationClient.buildRequest(request, original.profile, original.glossary)
+            val tokens = VideoBatchRequestBudget.estimateInputTokens(payload)
+            assertTrue(tokens <= VideoBatchRequestBudget.MAX_INPUT_TOKENS)
+            val dialogue = JSONObject(request.videoContext).getJSONArray("dialogue")
+            val indices = List(dialogue.length()) { dialogue.getJSONObject(it).getInt("index") }
+            assertEquals(indices.sorted().distinct(), indices)
+            assertTrue(indices.containsAll(request.indices))
+            val extra = indices.toSet() - request.indices.toSet()
+            assertTrue(extra.size <= VideoBatchRequestBudget.MAX_DIALOGUE_NEIGHBORS)
+            if (extra.isNotEmpty()) {
+                assertTrue(extra.any { it - 1 in request.indices || it + 1 in request.indices })
+            }
+            maxTargets.accumulateAndGet(request.cueIds.size, ::maxOf)
+            maxTokens.accumulateAndGet(tokens, ::maxOf)
+            maxContext.accumulateAndGet(extra.size, ::maxOf)
+            requested += request.cueIds
+        }
+        try {
+            VideoTranslationClient.overrideResponseForTest = { request ->
+                observe(request)
+                if (requested.size == 1) {
+                    assertTrue(request.cueIds.size in 2 until VideoHybridRecovery.INITIAL_TARGETS)
+                    reply(request.cueIds.drop(1).asReversed(), ::translation)
+                } else throw CancellationException("Simulated stop before the next response was committed")
+            }
+            runBatch(b.id, jobs())
+            assertEquals(2, requested.size)
+            val firstTargets = requested[0]
+            val interruptedTargets = requested[1]
+            assertTrue(firstTargets.first() in interruptedTargets)
+            val checkpoint = videoStore.load(original.id)
+            val retained = checkpoint.cues.filter { VideoTranslationPlan.isComplete(it, true) }.associateBy { it.id }
+            assertEquals(firstTargets.drop(1).toSet(), retained.keys)
+            assertTrue(interruptedTargets.none { it in retained })
+            for ((id, cue) in retained) assertEquals(translation(id), cue.translation)
+
+            // Model redelivery after process death. The worker instances and in-memory reservation are new.
+            batchStore.save(batchStore.load(b.id).copy(state = "RUNNING"))
+            VideoTranslationClient.overrideResponseForTest = { request ->
+                observe(request)
+                assertTrue(request.cueIds.none { it in retained })
+                reply(request.cueIds.asReversed(), ::translation)
+            }
+            runBatch(b.id, jobs(), start = false, timeoutMs = 180_000)
+            val resumedTargets = requested.drop(2).flatten()
+            val expectedPendingIds = cues.asSequence().map { it.id }.filterNot(retained::containsKey).toSet()
+            assertEquals(expectedPendingIds.size, resumedTargets.size)
+            assertEquals(expectedPendingIds, resumedTargets.toSet())
+            val finished = videoStore.load(original.id)
+            assertEquals("REVIEW", batchStore.load(b.id).state)
+            assertEquals(duration, finished.scanMs)
+            assertEquals(original.uri, finished.uri)
+            assertEquals(cues.size, finished.cues.size)
+            assertEquals(cues.map(::ocrIdentity), finished.cues.map(::ocrIdentity))
+            assertEquals(cues.map { translation(it.id) }, finished.cues.map { it.translation })
+            assertTrue(maxContext.get() > 0)
+            assertTrue(clock.waits.isEmpty())
+            assertEquals(VideoTimeline.srt(finished.cues, duration), videoStore.exportFile(original.id, "srt").readText())
+            println("Long OCR fixture: ${requested.size} requests, max ${maxTargets.get()} targets, " +
+                "max ${maxTokens.get()} estimated input tokens, ${VideoBatchRequestBudget.MAX_OUTPUT_TOKENS} max output tokens, " +
+                "max ${maxContext.get()} additional context rows, " +
+                "0 ms simulated retry wait, ${retained.size} kept across restart, ${finished.cues.size} valid translations")
+        } finally {
+            VideoTranslationClient.overrideResponseForTest = previous
+        }
+    }
+
+    @Test fun threeVideosAndTwoSlotsWaitForTheSame429Deadline() = runBlocking {
+        val clock = FakeClock()
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE).edit()
+            .putString("gemini_video_key_mode", GeminiKeyMode.BALANCED.name)
+            .putString("gemini_video_api_key_2", "synthetic-invalid-ciphertext")
+            .putString("gemini_video_api_key_2_plain_fallback", "fixture-second-slot").commit()
+        // A fixed final digit gives the first target ID each hash parity for the two configured slots.
+        val stem = UUID.randomUUID().toString().dropLast(1)
+        val originals = (1..3).map { project(it, id = "$stem$it") }
+        val b = batchStore.save(batch(originals, BatchExecutionMode.RAM_8_GB).copy(autoRetryEnabled = true))
+        val rpc = JSONObject().put("@type", "type.googleapis.com/google.rpc.RetryInfo").put("retryDelay", "7.250s")
+        val body = quotaBody("GenerateRequestsPerMinutePerProjectPerModel", "10", rpc)
+        val sends = mutableListOf<Send>()
+        val jobs = BatchJobs(context, VideoJobs(context), waitBeforeRetry = { wait ->
+            assertEquals(1, sends.size)
+            val waiting = batchStore.load(b.id)
+            assertEquals("RETRY_WAIT", waiting.state)
+            assertEquals(clock.read() + 7_250, waiting.autoRetryAtMs)
+            val failed = originals.mapNotNull { lastFailure(it) }.single { !it.fromSavedFailure }
+            assertEquals(429, failed.httpStatus)
+            assertEquals("SHORT_WINDOW", failed.quotaKind)
+            assertEquals(clock.read(), failed.failedAtMs)
+            clock.pauseForRetry(wait)
+        }, nowMs = clock::read)
+        withFakeExchange(clock, exchange = { request, slot ->
+            sends += Send(slot, clock.read())
+            if (sends.size == 1) throw VideoApiRecovery.httpFailure(429, body, "2", nowMs = clock.read())
+            reply(request.cueIds)
+        }) { runBatch(b.id, jobs) }
+        assertEquals(listOf(7_250L), clock.waits)
+        assertEquals(4, sends.size)
+        assertEquals(setOf(1, 2), sends.map { it.slot }.toSet())
+        assertEquals(listOf(FakeClock.START) + List(3) { FakeClock.START + 7_250 }, sends.map { it.timeMs })
+        assertEquals("REVIEW", batchStore.load(b.id).state)
+        originals.forEach { original ->
+            assertEquals(original.cues.first(), videoStore.load(original.id).cues.first())
+            assertTrue(videoStore.load(original.id).cues.all { it.translation.isNotBlank() })
+        }
+        println("Shared 429: ${sends.size} requests across ${originals.size} videos and two key slots; " +
+            "${clock.waits.single()} ms wait; 3 saved edits kept, 6 valid translations")
+    }
+
+    @Test fun unknown429HasOneBoundedBudgetAnd503HonorsItsHeader() = runBlocking {
+        for ((status, header, delayMs) in listOf(Triple(429, null, 60_000L), Triple(503, "3", 3_000L))) {
+            val clock = FakeClock()
+            val original = project(status)
+            val b = batchStore.save(batch(listOf(original)).copy(autoRetryEnabled = true))
+            var sends = 0
+            val jobs = BatchJobs(context, VideoJobs(context), waitBeforeRetry = { wait ->
+                val failure = requireNotNull(lastFailure(original))
+                assertEquals(status, failure.httpStatus)
+                assertEquals(if (status == 429) "UNKNOWN" else null, failure.quotaKind)
+                assertEquals(clock.read(), failure.failedAtMs)
+                assertFalse(failure.fromSavedFailure)
+                clock.pauseForRetry(wait)
+            }, nowMs = clock::read)
+            withFakeExchange(clock, exchange = { request, _ ->
+                sends++
+                if (status == 429 || sends == 1) {
+                    throw VideoApiRecovery.httpFailure(status, retryAfter = header, nowMs = clock.read())
+                }
+                reply(request.cueIds)
+            }) { runBatch(b.id, jobs) }
+            val retries = if (status == 429) BatchRecovery.MAX_ATTEMPTS else 1
+            assertEquals(retries + 1, sends)
+            assertEquals(List(retries) { delayMs }, clock.waits)
+            assertEquals(if (status == 429) "PAUSED" else "REVIEW", batchStore.load(b.id).state)
+            val saved = videoStore.load(original.id).cues
+            assertEquals(original.cues.first(), saved.first())
+            assertEquals(if (status == 429) 1 else 2, saved.count { it.translation.isNotBlank() })
+            println("HTTP $status: $sends requests, ${clock.waits.sum()} ms total wait, " +
+                "1 saved edit kept, ${saved.count { it.translation.isNotBlank() }} valid translations")
+        }
+    }
+
+    @Test fun dailyZeroAndPermissionFailuresStaySavedWithoutSendingOnRedelivery() = runBlocking {
+        val cases = listOf(
+            Triple(429, quotaBody("GenerateRequestsPerDayPerProjectPerModel", "20"), "DAILY"),
+            Triple(429, quotaBody("GenerateRequestsPerMinutePerProjectPerModel", "0"), "ZERO"),
+            Triple(401, "", null), Triple(403, "", null)
+        )
+        for ((status, body, kind) in cases) {
+            val clock = FakeClock()
+            val original = project(status)
+            val b = batchStore.save(batch(listOf(original)).copy(autoRetryEnabled = true))
+            var sends = 0
+            fun jobs() = BatchJobs(context, VideoJobs(context), waitBeforeRetry = clock::pauseForRetry, nowMs = clock::read)
+            withFakeExchange(clock, exchange = { _, _ ->
+                sends++
+                throw VideoApiRecovery.httpFailure(status, body, retryAfter = "4", nowMs = clock.read())
+            }) {
+                runBatch(b.id, jobs())
+                val saved = requireNotNull(lastFailure(original))
+                assertEquals(status, saved.httpStatus)
+                assertEquals(kind, saved.quotaKind)
+                assertEquals(FakeClock.START, saved.failedAtMs)
+                assertFalse(saved.fromSavedFailure)
+                assertEquals(if (status == 429) "API_QUOTA_EXHAUSTED" else "API_AUTH", saved.code)
+                assertEquals(0L, batchStore.load(b.id).autoRetryAtMs)
+                clock.advance(3 * 24 * 60 * 60_000L)
+                runBatch(b.id, jobs(), start = false)
+                assertEquals(saved, lastFailure(original))
+
+                // Redelivery after the video checkpoint committed, before the batch recorded the failure.
+                val paused = batchStore.load(b.id)
+                batchStore.save(paused.copy(state = "RUNNING", items = paused.items.map {
+                    it.copy(state = "PENDING", stageStatus = "RUNNING", errorCode = "", error = "")
+                }))
+                runBatch(b.id, jobs(), start = false)
+                assertEquals("PAUSED", batchStore.load(b.id).state)
+                assertEquals(saved.code, batchStore.load(b.id).items.single().errorCode)
+                assertEquals(saved, lastFailure(original))
+            }
+            assertEquals(1, sends)
+            assertTrue(clock.waits.isEmpty())
+            val savedCues = videoStore.load(original.id).cues
+            assertEquals(original.cues, savedCues.map { it.copy(error = "") })
+            assertEquals(1, savedCues.count { it.translation.isNotBlank() })
+            println("HTTP $status ${kind.orEmpty()}: $sends request, 0 ms wait, 1 saved edit kept, no request on redelivery")
+        }
+    }
+
+    @Test fun legacySavedRateLimitDoesNotSendUntilManualStart() = runBlocking {
+        val clock = FakeClock()
+        val original = project(1)
+        videoStore.save(original.copy(pipeline = original.pipeline.record(BatchPipelineStage.TRANSLATE,
+            "NEEDS_REVIEW", errorCode = "API_RATE_LIMIT", nextRetryAt = clock.read() - 1)))
+        val seed = batch(listOf(original))
+        val b = batchStore.save(seed.copy(state = "PAUSED", autoRetryEnabled = true, retryAfterMs = clock.read() - 1,
+            items = seed.items.map { it.copy(state = "NEEDS_REVIEW", stage = BatchPipelineStage.TRANSLATE,
+                stageStatus = "NEEDS_REVIEW", errorCode = "API_RATE_LIMIT", error = "[API_RATE_LIMIT] Đã lưu") }))
+        var sends = 0
+        fun jobs() = BatchJobs(context, VideoJobs(context), waitBeforeRetry = clock::pauseForRetry, nowMs = clock::read)
+        withFakeExchange(clock, exchange = { request, _ ->
+            sends++
+            assertEquals(listOf(original.cues.last().id), request.cueIds)
+            reply(request.cueIds)
+        }) {
+            runBatch(b.id, jobs(), start = false)
+            assertEquals(0, sends)
+            assertEquals("API_RATE_LIMIT", batchStore.load(b.id).items.single().errorCode)
+            assertNull(lastFailure(original)) // Legacy data has no HTTP observation/timestamp.
+            runBatch(b.id, jobs())
+        }
+        assertEquals(1, sends)
+        assertTrue(clock.waits.isEmpty())
+        assertEquals("REVIEW", batchStore.load(b.id).state)
+        assertEquals(original.cues.first(), videoStore.load(original.id).cues.first())
+        println("Legacy saved error: 0 requests on redelivery, 1 on manual start, 0 ms wait, 1 saved edit kept")
+    }
+
+    private fun ocrIdentity(cue: VideoCue) = cue.copy(translation = "", model = "", error = "", draftVi = "",
+        polishedVi = "", refinementState = "", qualityFlags = emptyList(), version = 1)
+
+    private suspend fun runBatch(id: String, jobs: BatchJobs, start: Boolean = true, timeoutMs: Long = 20_000) {
+        val done = CompletableDeferred<Unit>()
+        try {
+            if (start) jobs.start(id)
+            jobs.execute(id) { done.complete(Unit) }
+            withTimeout(timeoutMs) { done.await() }
+        } finally {
+            jobs.cancel()
+            if (jobs.busy.value != null) withTimeout(20_000) { done.await() }
+        }
+    }
+
+    private fun lastFailure(project: VideoProject) =
+        videoStore.load(project.id).pipeline.task(BatchPipelineStage.TRANSLATE).lastApiFailure
+
+    private fun quotaBody(id: String, value: String, vararg extra: JSONObject): String {
+        val violations = JSONArray().put(JSONObject().put("quotaId", id).put("quotaValue", value))
+        val details = JSONArray().put(JSONObject().put("@type", "type.googleapis.com/google.rpc.QuotaFailure")
+            .put("violations", violations))
+        extra.forEach { details.put(it) }
+        return JSONObject().put("error", JSONObject().put("details", details)).toString()
+    }
+
+    private suspend fun withFakeExchange(
+        clock: FakeClock,
+        exchange: suspend (VideoTranslationPlan.Batch, Int) -> String,
+        block: suspend () -> Unit
+    ) {
+        val previousQuota = VideoGeminiAccounts.overrideBatchQuotaForTest
+        val previousExchange = VideoTranslationClient.overrideBatchExchangeForTest
+        try {
+            VideoGeminiAccounts.overrideBatchQuotaForTest = VideoBatchGeminiQuota(clockMs = clock::read, awaitTurn = {})
+            VideoTranslationClient.overrideBatchExchangeForTest = exchange
+            block()
+        } finally {
+            VideoTranslationClient.overrideBatchExchangeForTest = previousExchange
+            VideoGeminiAccounts.overrideBatchQuotaForTest = previousQuota
+        }
+    }
+
+    private data class Send(val slot: Int, val timeMs: Long)
+
+    private class FakeClock {
+        private val now = AtomicLong(START)
+        val waits = mutableListOf<Long>()
+        fun read(): Long = now.get()
+        fun advance(ms: Long) { now.addAndGet(ms) }
+        fun pauseForRetry(ms: Long) { waits += ms; advance(ms) }
+        companion object { const val START = 1_800_000_000_000L }
     }
 }

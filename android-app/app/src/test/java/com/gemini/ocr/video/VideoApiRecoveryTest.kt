@@ -24,6 +24,103 @@ import java.util.concurrent.atomic.AtomicLong
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class VideoApiRecoveryTest {
+    @Test fun batchQuotaHonorsProviderWindowAcrossQueuedVideoAndRestartWithoutMoreCalls() = runBlocking {
+        var now = 1_000L
+        var stored: VideoApiException? = null
+        var physical = 0
+        var reduced = 0
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val body = """{"error":{"details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                {"quotaId":"GenerateContentInputTokensPerMinutePerProject"}]},
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7.250000001s"}]}}"""
+        fun quota() = VideoBatchGeminiQuota(clockMs = { now }, awaitTurn = {}, load = { stored },
+            save = { stored = it }, awaitReducedTurn = { reduced++ })
+        val original = quota()
+        VideoApiRecovery.withAdaptiveBatch(4) {
+            coroutineScope {
+                val failed = async { runCatching {
+                    original.request({ physical++ }) {
+                        entered.complete(Unit)
+                        release.await()
+                        throw VideoApiRecovery.httpFailure(429, body, "2", now)
+                    }
+                }.exceptionOrNull() as VideoApiException }
+                entered.await()
+                val peer = async { runCatching { original.request({ physical++ }) { "unexpected" } }
+                    .exceptionOrNull() as VideoApiException }
+                yield()
+                assertEquals(1, physical)
+                release.complete(Unit)
+                val actual = failed.await()
+                assertEquals(8_251L, actual.nextRetryAt)
+                assertEquals(1_000L, actual.failedAtMs)
+                assertEquals(429, actual.httpStatus)
+                assertEquals(VideoQuotaKind.SHORT_WINDOW, actual.quotaKind)
+                assertTrue(actual.inputTokenLimited)
+                assertFalse(actual.fromSavedFailure)
+                assertTrue(peer.await().fromSavedFailure)
+                assertEquals(2, VideoApiRecovery.currentCapacity()!!.limit)
+            }
+        }
+        val reopened = quota()
+        now = 8_250L
+        val saved = runCatching { reopened.request({ physical++ }) {} }.exceptionOrNull() as VideoApiException
+        assertTrue(saved.fromSavedFailure)
+        assertEquals(8_251L, saved.nextRetryAt)
+        assertEquals(1, physical)
+        now++
+        repeat(5) { reopened.request({ physical++ }) {} }
+        assertEquals(6, physical)
+        assertEquals(4, reduced)
+    }
+
+    @Test fun batchTerminalFailureStopsPeersUntilANewExplicitExecution() = runBlocking {
+        val quota = VideoBatchGeminiQuota(clockMs = { 1_000L }, awaitTurn = {})
+        val terminalResponses = listOf(
+            VideoApiRecovery.httpFailure(401, nowMs = 1_000L),
+            VideoApiRecovery.httpFailure(403, nowMs = 1_000L),
+            VideoApiRecovery.httpFailure(429, """{"error":{"message":"Daily quota exceeded"}}""", "60", 1_000L),
+            VideoApiRecovery.httpFailure(429, """{"error":{"message":"Quota exceeded, limit: 0"}}""", "60", 1_000L)
+        )
+        for (expected in terminalResponses) {
+            var physical = 0
+            VideoApiRecovery.withAdaptiveBatch(3) {
+                val failure = runCatching { quota.request({ physical++ }) { throw expected } }.exceptionOrNull()
+                assertSame(expected, failure)
+                val shared = runCatching { quota.request({ physical++ }) {} }.exceptionOrNull() as VideoApiException
+                assertTrue(shared.fromSavedFailure)
+                assertEquals(expected.httpStatus, shared.httpStatus)
+                assertEquals(expected.quotaKind, shared.quotaKind)
+                assertEquals(0L, shared.nextRetryAt)
+            }
+            assertEquals(1, physical)
+            VideoApiRecovery.withAdaptiveBatch(3) { quota.request({ physical++ }) {} }
+            assertEquals(2, physical)
+        }
+    }
+
+    @Test fun batchUnknownQuotaUsesOneMinuteWithoutInventingAQuotaType() = runBlocking {
+        var now = 1_000L
+        var physical = 0
+        val quota = VideoBatchGeminiQuota(clockMs = { now }, awaitTurn = {})
+        val failure = runCatching { quota.request({ physical++ }) {
+            throw VideoApiRecovery.httpFailure(429, """{"error":{"message":"Quota exceeded. Check daily limits."}}""", nowMs = now)
+        } }.exceptionOrNull() as VideoApiException
+        assertEquals(1, physical)
+        assertEquals(VideoQuotaKind.UNKNOWN, failure.quotaKind)
+        assertTrue(failure.detail.contains("Chưa xác định loại hạn mức"))
+        assertEquals(61_000L, failure.nextRetryAt)
+        now = 61_000L
+        val service = runCatching { quota.request({ physical++ }) {
+            throw VideoApiRecovery.httpFailure(503, retryAfter = "3", nowMs = now)
+        } }.exceptionOrNull() as VideoApiException
+        assertEquals(2, physical)
+        assertEquals(64_000L, service.nextRetryAt)
+        assertEquals(503, service.httpStatus)
+    }
+
     @Test fun optedInScopeOverlapsIndependentRequestsWithinItsLimit() = runBlocking {
         var active = 0; var peak = 0; var completed = 0
         val twoActive = CompletableDeferred<Unit>()
@@ -263,13 +360,18 @@ class VideoApiRecoveryTest {
         """.trimIndent()
         val temporary = VideoApiRecovery.httpFailure(429, shortWindow, "20")
         assertEquals("API_RATE_LIMIT", temporary.code)
+        assertEquals(VideoQuotaKind.SHORT_WINDOW, temporary.quotaKind)
         assertTrue(temporary.transient)
         assertEquals(61_001L, temporary.retryAfterMs)
+        assertEquals(90_000_000L, VideoApiRecovery.httpFailure(429, retryAfter = "90000", batchQuota = true).retryAfterMs)
+        assertEquals(86_400_000L, VideoApiRecovery.httpFailure(429, retryAfter = "90000").retryAfterMs)
         val daily = VideoApiRecovery.httpFailure(429, shortWindow.replace("PerMinute", "PerDay"))
         assertEquals("API_QUOTA_EXHAUSTED", daily.code)
+        assertEquals(VideoQuotaKind.DAILY, daily.quotaKind)
         assertFalse(daily.transient)
         val disabledQuota = VideoApiRecovery.httpFailure(429, shortWindow.replace("\"15\"", "\"0\""))
         assertEquals("API_QUOTA_EXHAUSTED", disabledQuota.code)
+        assertEquals(VideoQuotaKind.ZERO, disabledQuota.quotaKind)
     }
 
     @Test fun billingAdviceAndRollingSpendLimitDoNotBecomeDayLongQuotaFailures() {

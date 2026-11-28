@@ -57,7 +57,8 @@ private class BatchStagePaused : RuntimeException()
 class BatchJobs internal constructor(
     private val context: Context,
     private val videos: VideoJobs = VideoJobs.get(context),
-    private val waitBeforeRetry: suspend (Long) -> Unit = { delay(it) }
+    private val waitBeforeRetry: suspend (Long) -> Unit = { delay(it) },
+    private val nowMs: () -> Long = System::currentTimeMillis
 ) {
     private val store = BatchStore(context)
     private val videoStore = VideoStore(context)
@@ -357,14 +358,16 @@ class BatchJobs internal constructor(
         check(edits.tryLock()) { "Đang lưu thay đổi. Hãy thử lại sau." }
         try {
             val batch = store.load(id); require(batch.items.isNotEmpty()) { "Thêm video trước khi bắt đầu." }
+            val now = nowMs()
             val canExtractLocally=batch.translationMode==VideoTranslationMode.HYBRID && batch.items.any{
                 VideoHybridWorkflow.requiresExtraction(videoStore.load(it.projectId))}
-            check(batch.translationMode == VideoTranslationMode.OFFLINE || canExtractLocally || System.currentTimeMillis() >= batch.retryAfterMs) {
-                "Gemini đang trong thời gian chờ hạn mức. Còn ${((batch.retryAfterMs-System.currentTimeMillis()).coerceAtLeast(0)+999)/1000} giây; checkpoint vẫn được giữ."
+            check(batch.translationMode == VideoTranslationMode.OFFLINE || canExtractLocally || now >= batch.retryAfterMs) {
+                "Gemini đang trong thời gian chờ hạn mức. Còn ${batchRetrySeconds(batch.retryAfterMs, now)} giây; checkpoint vẫn được giữ."
             }
             videos.reserveBatch(id); stopState = "PAUSED"; stopRequested = false; mutableBusy.value = id
             try {
                 persist(batch.copy(state = "RUNNING", autoRetryAtMs = 0, autoRetryAttempts = 0,
+                    retryAfterMs = batch.retryAfterMs.takeIf { it > now } ?: 0L,
                     message = "Đã xác nhận thứ tự; đang khởi động xử lý tuần tự."))
                 ContextCompat.startForegroundService(context, Intent(context, BatchProcessingService::class.java).putExtra("batch", id))
             }
@@ -493,6 +496,7 @@ class BatchJobs internal constructor(
                 // Each episode owns its source-to-saved-subtitle pipeline. The media lane is
                 // serial; independent text lanes use the existing provider/checkpoint machinery.
                 val stateLock = Mutex()
+                var sharedFailureObserved = false
                 suspend fun processItem(item: BatchItem, stage: BatchPipelineStage, parallel: Boolean): Boolean {
                     currentCoroutineContext().ensureActive()
                     if (item.projectId in manualIds) return false
@@ -501,16 +505,18 @@ class BatchJobs internal constructor(
                         stateLock.withLock { batch = stageState(batch, item.projectId, stage, "COMPLETE") }
                         return true
                     }
-                    if (stage == BatchPipelineStage.TRANSLATE && previous.translationMode != VideoTranslationMode.OFFLINE &&
-                        System.currentTimeMillis() < batch.retryAfterMs) {
+                    val cloudTranslation = stage == BatchPipelineStage.TRANSLATE && previous.translationMode != VideoTranslationMode.OFFLINE
+                    val offlinePolish = stage == BatchPipelineStage.POLISH && previous.translationMode == VideoTranslationMode.OFFLINE &&
+                        previous.offlinePolishPolicy != VideoPolishPolicy.NONE
+                    if ((cloudTranslation || stage == BatchPipelineStage.POLISH) &&
+                        stateLock.withLock { sharedFailureObserved }) return false
+                    if (cloudTranslation && nowMs() < batch.retryAfterMs) {
                         stateLock.withLock { batch = persist(batch.copy(state = "PAUSED", currentStage = stage)) }
                         throw BatchStagePaused()
                     }
                     if (stage != BatchPipelineStage.EXTRACT && BatchPipelineStage.entries.take(stage.ordinal).any { !VideoStagedPipeline.completed(previous, it) }) return false
-                    val offlinePolish = stage == BatchPipelineStage.POLISH && previous.translationMode == VideoTranslationMode.OFFLINE &&
-                        previous.offlinePolishPolicy != VideoPolishPolicy.NONE
                     if (offlinePolish && !VideoStagedPipeline.completed(previous, stage) &&
-                        System.currentTimeMillis() < batch.retryAfterMs) {
+                        nowMs() < batch.retryAfterMs) {
                         stateLock.withLock {
                             batch = persist(batch.copy(state = "PAUSED",
                                 message = "Đã lưu bản dịch trên máy. Gemini đang chờ hạn mức; chờ rồi tiếp tục hoặc tắt hiệu đính để hoàn thiện bản offline."))
@@ -536,17 +542,21 @@ class BatchJobs internal constructor(
                         val task = videoStore.load(item.projectId).pipeline.task(stage)
                         val code = task.errorCode.ifBlank { VideoStagedPipeline.errorCode(e) }
                         val status = when (code) { "API_AUTH" -> 403; "API_QUOTA_EXHAUSTED", "API_RATE_LIMIT" -> 429; else -> sharedGeminiFailure(message) }
-                        val transportOutage = code in setOf("API_NETWORK", "API_TIMEOUT") || code.startsWith("API_SERVICE_")
-                        val stop = status != null || task.nextRetryAt > System.currentTimeMillis() || transportOutage
+                        val now = nowMs()
+                        val stop = BatchRecovery.stopsApiQueue(code) || status != null || task.nextRetryAt > now
+                        val sharedPreflight = task.lastApiFailure?.let { it.code == code && it.fromSavedFailure } == true
+                        val legacyCooldown = if (status == 429 && code != "API_QUOTA_EXHAUSTED" && task.nextRetryAt == 0L)
+                            now + 61_000L else 0L
                         stateLock.withLock {
-                            batch = stageState(batch, item.projectId, stage, "NEEDS_REVIEW", message, code)
-                            if (stop) batch = persist(batch.copy(state = "PAUSED",
-                                retryAfterMs = maxOf(batch.retryAfterMs, task.nextRetryAt,
-                                    if (status == 429 && code != "API_QUOTA_EXHAUSTED") System.currentTimeMillis() + 61_000L else 0),
+                            if (stop && sharedPreflight) sharedFailureObserved = true
+                            val failed = updateStage(batch, item.projectId, stage, "NEEDS_REVIEW", message, code)
+                            batch = persist(if (stop) failed.copy(state = "PAUSED",
+                                retryAfterMs = maxOf(failed.retryAfterMs, task.nextRetryAt, legacyCooldown),
                                 message = if (offlinePolish) "$message Bản nháp đã lưu. Thử lại hiệu đính hoặc tắt hiệu đính để hoàn thiện bản trên máy."
-                                else "$message Đã lưu các giai đoạn hoàn thành. Tạm ngừng gửi yêu cầu Gemini."))
+                                else "$message Đã lưu các giai đoạn hoàn thành. Tạm ngừng gửi yêu cầu Gemini.") else failed)
                         }
-                        if (stop) throw BatchStagePaused()
+                        // A sibling skipped by the quota gate must let the sending lane save its response.
+                        if (stop && !sharedPreflight) throw BatchStagePaused()
                         return false
                     }
                 }
@@ -595,6 +605,7 @@ class BatchJobs internal constructor(
                     }))
                     return
                 }
+                if (sharedFailureObserved) return
                 for (item in batch.items.toList()) {
                     currentCoroutineContext().ensureActive()
                     if (item.projectId in manualIds) continue
@@ -626,7 +637,7 @@ class BatchJobs internal constructor(
                         val status = sharedGeminiFailure(message)
                         if (status != null) {
                             batch = persist(batch.copy(state = "PAUSED",
-                                retryAfterMs = if (status == 429) maxOf(batch.retryAfterMs, System.currentTimeMillis() + 61_000L) else batch.retryAfterMs,
+                                retryAfterMs = if (status == 429) maxOf(batch.retryAfterMs, nowMs() + 61_000L) else batch.retryAfterMs,
                                 message = if (status == 429) "$message Đã tạm dừng toàn bộ hàng đợi và lưu thời gian chờ hạn mức; các video sau chưa được gửi."
                                 else "$message Đã tạm dừng toàn bộ hàng đợi. Kiểm tra khóa/quyền API rồi chủ động bấm Tiếp tục."))
                             return
@@ -688,31 +699,52 @@ class BatchJobs internal constructor(
                 if (waitMs > 0) waitBeforeRetry(waitMs)
                 gate()
                 batch = persist(batch.copy(state = "RUNNING", autoRetryAtMs = 0,
+                    retryAfterMs = 0,
                     autoRetryAttempts = batch.autoRetryAttempts + 1,
                     message = "Đang tự tiếp tục phần còn thiếu. Lượt ${batch.autoRetryAttempts + 1}/${BatchRecovery.MAX_ATTEMPTS}."))
+            }
+            suspend fun scheduleRetry(): Boolean {
+                val now = nowMs()
+                val deadline = BatchRecovery.nextAttemptAt(batch, now) ?: return false
+                batch = persist(batch.copy(state = "RETRY_WAIT", autoRetryAtMs = deadline,
+                    message = "Đã lưu tiến độ. Sẽ tự tiếp tục phần còn thiếu khi hết thời gian chờ."))
+                continueAutomatically(deadline - now)
+                return true
             }
             try {
                 batch = store.load(id); loaded = true
                 if (stopRequested) throw CancellationException("Stopped before service started")
+                val savedTextDeadline = batch.items.asSequence()
+                    .filter { it.stage == BatchPipelineStage.TRANSLATE || it.stage == BatchPipelineStage.POLISH }
+                    .filter { it.stageStatus in setOf("RUNNING", "PAUSED", "NEEDS_REVIEW") }
+                    .mapNotNull { item -> runCatching { videoStore.load(item.projectId).pipeline.task(item.stage).nextRetryAt }.getOrNull() }
+                    .maxOrNull() ?: 0L
+                if (savedTextDeadline > maxOf(batch.retryAfterMs, nowMs())) {
+                    batch = persist(batch.copy(retryAfterMs = savedTextDeadline))
+                }
                 var automatic = recovering
+                var runPass = true
                 if (recovering) {
-                    val remaining = maxOf(batch.autoRetryAtMs, batch.retryAfterMs) - System.currentTimeMillis()
+                    val remaining = maxOf(batch.autoRetryAtMs, batch.retryAfterMs) - nowMs()
                     if (batch.state == "RETRY_WAIT" && batch.autoRetryAtMs > 0) {
                         continueAutomatically(remaining)
-                    } else if (remaining > 0) {
-                        waitBeforeRetry(remaining)
-                        gate()
+                    } else {
+                        val recovered = recoverApiFailure(batch)
+                        if (recovered != batch) {
+                            batch = persist(recovered)
+                            runPass = scheduleRetry()
+                        } else if (remaining > 0) {
+                            waitBeforeRetry(remaining)
+                            gate()
+                            batch = persist(batch.copy(retryAfterMs = 0))
+                        }
                     }
                 }
-                VideoApiRecovery.withAdaptiveBatch(BatchParallelism.workerLimit(context, batch.executionMode)) {
-                    while (true) {
+                VideoApiRecovery.withAdaptiveBatch(BatchParallelism.workerLimit(context, batch.executionMode), clockMs = nowMs) {
+                    while (runPass) {
                         currentCoroutineContext().ensureActive()
                         processPass(automatic)
-                        val now = System.currentTimeMillis()
-                        val deadline = BatchRecovery.nextAttemptAt(batch, now) ?: break
-                        batch = persist(batch.copy(state = "RETRY_WAIT", autoRetryAtMs = deadline,
-                            message = "Đã lưu tiến độ. Sẽ tự tiếp tục phần còn thiếu khi hết thời gian chờ."))
-                        continueAutomatically(deadline - now)
+                        runPass = scheduleRetry()
                         automatic = true
                     }
                 }
@@ -735,11 +767,32 @@ class BatchJobs internal constructor(
             }
         }
     }
-    private fun stageState(batch:BatchProject,projectId:String,stage:BatchPipelineStage,status:String,error:String="",errorCode:String=""):BatchProject = persist(batch.copy(
+
+    /** The video AtomicFile can commit a provider failure before the batch worker records it. */
+    private fun recoverApiFailure(batch: BatchProject): BatchProject {
+        var retryAt = batch.retryAfterMs
+        var message = ""
+        val items = batch.items.map { item ->
+            if (item.stageStatus != "RUNNING") return@map item
+            val video = runCatching { videoStore.load(item.projectId) }.getOrNull() ?: return@map item
+            val task = video.pipeline.task(item.stage)
+            if (task.status != "NEEDS_REVIEW" || task.lastApiFailure?.code != task.errorCode ||
+                (!BatchRecovery.stopsApiQueue(task.errorCode) && task.nextRetryAt <= 0)) return@map item
+            message = video.message
+            retryAt = maxOf(retryAt, task.nextRetryAt)
+            item.copy(state = "NEEDS_REVIEW", stageStatus = "NEEDS_REVIEW", errorCode = task.errorCode, error = video.message)
+        }
+        if (message.isBlank()) return batch
+        return BatchPlan.interrupted(batch.copy(state = "PAUSED", retryAfterMs = retryAt, message = message, items = items))
+    }
+    private fun stageState(batch: BatchProject, projectId: String, stage: BatchPipelineStage, status: String,
+        error: String = "", errorCode: String = ""): BatchProject = persist(updateStage(batch, projectId, stage, status, error, errorCode))
+
+    private fun updateStage(batch:BatchProject,projectId:String,stage:BatchPipelineStage,status:String,error:String="",errorCode:String=""):BatchProject = batch.copy(
         currentStage=stage,
         items=batch.items.map{if(it.projectId==projectId)it.copy(stage=stage,stageStatus=status,error=error,errorCode=errorCode,
             state=if(status=="NEEDS_REVIEW")"NEEDS_REVIEW" else if(stage==BatchPipelineStage.FINISH && status=="COMPLETE")"DONE" else "PENDING") else it},
-        message=if(error.isNotBlank())error else "${stage.label}: ${batch.items.indexOfFirst{it.projectId==projectId}+1}/${batch.items.size}"))
+        message=if(error.isNotBlank())error else "${stage.label}: ${batch.items.indexOfFirst{it.projectId==projectId}+1}/${batch.items.size}")
     private fun itemState(batch: BatchProject, projectId: String, state: String, error: String = ""): BatchProject = persist(batch.copy(
         items = batch.items.map { if (it.projectId == projectId) it.copy(state = state, error = error,
             errorCode = if (error.isBlank()) "" else it.errorCode) else it },

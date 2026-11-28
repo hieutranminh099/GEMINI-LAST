@@ -56,7 +56,7 @@ internal class VideoAdaptiveAdmission(private val ceiling: Int, private val capa
     }
 
     fun failed(failure: VideoApiException) = synchronized(lock) {
-        if (failure.transient && failure.code in setOf("API_RATE_LIMIT", "API_NETWORK", "API_TIMEOUT",
+        if (failure.transient && !failure.fromSavedFailure && failure.code in setOf("API_RATE_LIMIT", "API_NETWORK", "API_TIMEOUT",
                 "API_SERVICE_408", "API_SERVICE_500", "API_SERVICE_502", "API_SERVICE_503", "API_SERVICE_504")) {
             limit = maxOf(1, limit / 2)
             successes = 0

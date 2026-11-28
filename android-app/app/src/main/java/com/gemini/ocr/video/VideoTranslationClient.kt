@@ -25,6 +25,8 @@ internal class VideoTranslationClient(private val context: Context? = null) {
 
     suspend fun translate(apiKey: String, batch: VideoTranslationPlan.Batch, profile: String, glossary: String,
                           onRetry: suspend (Int, Long, String) -> Unit = { _, _, _ -> },
+                          batchQuota: Boolean = false,
+                          quotaAffinity: String = batch.cueIds.firstOrNull().orEmpty(),
                           beforeDispatch: suspend () -> Unit): Result = withContext(Dispatchers.IO) {
         require(batch.cueIds.distinct().size == batch.cueIds.size && batch.cueIds.size == batch.texts.size)
         val fullPayload=if(batch.fullDialogue)buildRequest(batch,profile,glossary) else null
@@ -45,24 +47,37 @@ internal class VideoTranslationClient(private val context: Context? = null) {
             return@withContext Result(batch.cueIds.zip(outcome.translations).toMap(), emptyList(), outcome.modelUsed,
                 outcome.elapsedMs, outcome.quotaWaitMs, outcome.generationMetrics)
         }
-        val keyReady = context?.let { AppSettings(it).hasGeminiVideoKey() } ?: apiKey.isNotBlank()
-        require(keyReady) { "Chưa có khóa Gemini API. Mở Tùy chỉnh để cấu hình." }
+        if (!batchQuota) {
+            val keyReady = context?.let { AppSettings(it).hasGeminiVideoKey() } ?: apiKey.isNotBlank()
+            require(keyReady) { "Chưa có khóa Gemini API. Mở Tùy chỉnh để cấu hình." }
+        }
         val payload = fullPayload ?: buildRequest(batch, profile, glossary)
         val operation: suspend (String) -> String = { selectedKey ->
             StandaloneTranslator.beforeNetworkCallForTest?.invoke()
             val request = Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/models/${StandaloneTranslator.FAST_MODEL}:generateContent")
                 .header("x-goog-api-key", selectedKey)
                 .post(singleAttemptBody(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))).build()
-            VideoApiRecovery.exchange(requestClient(batch.fullDialogue), request)
+            VideoApiRecovery.exchange(requestClient(batch.fullDialogue), request, batchQuota = batchQuota)
         }
-        val body = if (context == null) VideoApiRecovery.run(beforeDispatch, onRetry = onRetry) { operation(apiKey) }
-            else VideoGeminiAccounts.request(context, apiKey, beforeDispatch, onRetry, operation)
+        val body = when {
+            batchQuota -> VideoGeminiAccounts.requestBatch(context, apiKey, quotaAffinity, beforeDispatch) { selected ->
+                val override = overrideBatchExchangeForTest
+                if (override == null) operation(selected.key)
+                else {
+                    check(com.gemini.ocr.BuildConfig.DEBUG)
+                    override(batch, selected.slot)
+                }
+            }
+            context == null -> VideoApiRecovery.run(beforeDispatch, onRetry = onRetry) { operation(apiKey) }
+            else -> VideoGeminiAccounts.request(context, apiKey, beforeDispatch, onRetry, operation)
+        }
         parseResponse(body, batch, glossary, StandaloneTranslator.FAST_MODEL, (System.nanoTime() - started) / 1_000_000L)
     }
 
     companion object {
         internal const val COMPACT_TARGETS_REVISION = "video-ocr-targets-v1"
         @Volatile internal var overrideResponseForTest: (suspend (VideoTranslationPlan.Batch) -> String)? = null
+        @Volatile internal var overrideBatchExchangeForTest: (suspend (VideoTranslationPlan.Batch, Int) -> String)? = null
         internal fun withCompactTargets(batch: VideoTranslationPlan.Batch): VideoTranslationPlan.Batch {
             require(!batch.fullDialogue)
             val context = JSONObject(batch.videoContext).put("promptRevision", COMPACT_TARGETS_REVISION)
@@ -102,7 +117,7 @@ internal class VideoTranslationClient(private val context: Context? = null) {
         private fun fullDialogueRequest(batch:VideoTranslationPlan.Batch,profile:String,glossary:String):String {
             require(batch.indices.isNotEmpty() && batch.indices.size==batch.cueIds.size &&
                 batch.indices.distinct().size==batch.indices.size && batch.indices.sorted()==batch.indices)
-            require(batch.maxOutputTokens in 8192..VideoFullDialoguePlan.MAX_OUTPUT_TOKENS)
+            require(batch.maxOutputTokens in VideoBatchRequestBudget.MIN_OUTPUT_TOKENS..VideoFullDialoguePlan.MAX_OUTPUT_TOKENS)
             require(batch.videoContext.toByteArray(Charsets.UTF_8).size<=VideoFullDialoguePlan.MAX_CONTEXT_BYTES)
             val context=JSONObject(batch.videoContext)
             val targets=context.getJSONArray("targetIds")

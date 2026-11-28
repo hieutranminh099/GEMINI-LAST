@@ -23,6 +23,9 @@ internal class VideoPolishClient(
     suspend fun polish(apiKey: String, batch: VideoTranslationPlan.Batch, profile: String, glossary: String,
                        onRetry: suspend (Int, Long, String) -> Unit = { _, _, _ -> },
                        allowPartial: Boolean = false,
+                       batchQuota: Boolean = false,
+                       quotaAffinity: String = batch.cueIds.firstOrNull().orEmpty(),
+                       acceptPartial: Boolean = allowPartial,
                        beforeCall: suspend () -> Unit): VideoTranslationClient.Result = withContext(Dispatchers.IO) {
         require(batch.offlineDrafts.size == batch.texts.size && batch.offlineDrafts.all { it.isNotBlank() })
         var remainingMs = inactivityMs
@@ -41,10 +44,12 @@ internal class VideoPolishClient(
         overrideResponseForTest?.let { override ->
             check(com.gemini.ocr.BuildConfig.DEBUG)
             beforeCall()
-            return@withContext validated(exchangeWhileActive { override(batch) }, batch, glossary, allowPartial)
+            return@withContext validated(exchangeWhileActive { override(batch) }, batch, glossary, allowPartial, acceptPartial)
         }
-        val keyReady = context?.let { AppSettings(it).hasGeminiVideoKey() } ?: apiKey.isNotBlank()
-        if (!keyReady) throw VideoApiException("API_AUTH", detail = "Chưa có khóa Gemini API. Bản dịch nháp được giữ.")
+        if (!batchQuota) {
+            val keyReady = context?.let { AppSettings(it).hasGeminiVideoKey() } ?: apiKey.isNotBlank()
+            if (!keyReady) throw VideoApiException("API_AUTH", detail = "Chưa có khóa Gemini API. Bản dịch nháp được giữ.")
+        }
         val payload = buildRequest(batch, profile, glossary)
         val started = System.nanoTime()
         val operation: suspend (String) -> String = { selectedKey ->
@@ -54,19 +59,29 @@ internal class VideoPolishClient(
                 .url("https://generativelanguage.googleapis.com/v1beta/models/${StandaloneTranslator.FAST_MODEL}:generateContent")
                 .header("x-goog-api-key", selectedKey)
                 .post(singleAttemptBody(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))).build()
-            exchangeWhileActive { VideoApiRecovery.exchange(httpClient, request) }
+            exchangeWhileActive { VideoApiRecovery.exchange(httpClient, request, batchQuota = batchQuota) }
         }
-        val body = if (context == null) VideoApiRecovery.run(beforeCall, onRetry = onRetry) { operation(apiKey) }
-            else VideoGeminiAccounts.request(context, apiKey, beforeCall, onRetry, operation)
-        validated(body, batch, glossary, allowPartial, (System.nanoTime() - started) / 1_000_000L)
+        val body = when {
+            batchQuota -> VideoGeminiAccounts.requestBatch(context, apiKey, quotaAffinity, beforeCall) { slot ->
+                val override = overrideBatchExchangeForTest
+                if (override == null) operation(slot.key)
+                else {
+                    check(com.gemini.ocr.BuildConfig.DEBUG)
+                    exchangeWhileActive { override(batch) }
+                }
+            }
+            context == null -> VideoApiRecovery.run(beforeCall, onRetry = onRetry) { operation(apiKey) }
+            else -> VideoGeminiAccounts.request(context, apiKey, beforeCall, onRetry, operation)
+        }
+        validated(body, batch, glossary, allowPartial, acceptPartial, (System.nanoTime() - started) / 1_000_000L)
     }
 
     private fun validated(body: String, batch: VideoTranslationPlan.Batch, glossary: String, allowPartial: Boolean,
-                          elapsedMs: Long = 0): VideoTranslationClient.Result {
+                          acceptPartial: Boolean, elapsedMs: Long = 0): VideoTranslationClient.Result {
         val result = VideoTranslationClient.parseResponse(body, batch, glossary, StandaloneTranslator.FAST_MODEL, elapsedMs)
         // The legacy editorial route keeps its whole-group contract. Opted-in offline
         // projects may checkpoint validated IDs from a complete, structured response.
-        if (!allowPartial && result.missingIds.isNotEmpty()) throw VideoApiException("POLISH_MISSING_IDS", splitAllowed = true,
+        if (!acceptPartial && result.missingIds.isNotEmpty()) throw VideoApiException("POLISH_MISSING_IDS", splitAllowed = true,
             detail = "Hiệu đính chưa đủ ID; toàn bộ bản dịch nháp được giữ.")
         val candidate = JSONObject(body).getJSONArray("candidates").getJSONObject(0)
         if (candidate.optString("finishReason") == "MAX_TOKENS") throw VideoApiException("POLISH_TRUNCATED", splitAllowed = true,
@@ -101,6 +116,7 @@ internal class VideoPolishClient(
 
     companion object {
         @Volatile internal var overrideResponseForTest: (suspend (VideoTranslationPlan.Batch) -> String)? = null
+        @Volatile internal var overrideBatchExchangeForTest: (suspend (VideoTranslationPlan.Batch) -> String)? = null
         internal fun buildRequest(batch: VideoTranslationPlan.Batch, profile: String, glossary: String): String {
             require(batch.offlineDrafts.size == batch.cueIds.size && batch.offlineDrafts.all { it.isNotBlank() })
             val request = JSONObject(VideoTranslationClient.buildRequest(batch, profile, glossary))

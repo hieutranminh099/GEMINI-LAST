@@ -134,7 +134,7 @@ class VideoSmartBatchWorkerTest {
         VideoTranslationClient.overrideResponseForTest = { batch ->
             requests += batch.cueIds
             if (requests.size == 1) JSONObject().put("promptFeedback", JSONObject().put("blockReason", "SAFETY")).toString()
-            else throw VideoApiException("API_SERVICE_503", transient = true, nextRetryAt = deadline)
+            else throw VideoApiRecovery.httpFailure(503).withRecovery(deadline = deadline)
         }
         val jobs = VideoJobs(context)
         val owner = UUID.randomUUID().toString()
@@ -149,6 +149,7 @@ class VideoSmartBatchWorkerTest {
             assertEquals("NEEDS_REVIEW", checkpoint.status)
             assertEquals("TEXT_BLOCKED", checkpoint.errorCode)
             assertEquals(deadline, checkpoint.nextRetryAt)
+            assertEquals(503, checkpoint.lastApiFailure?.httpStatus)
             assertEquals(listOf(approved, accepted), saved.cues.take(2))
             assertTrue(saved.cues.drop(2).all { it.translation.isBlank() })
             assertTrue(saved.cues[2].error.contains("TEXT_BLOCKED"))

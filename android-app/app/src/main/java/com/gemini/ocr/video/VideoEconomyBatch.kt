@@ -26,6 +26,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
     private val transportForTest: (suspend (String,JSONObject?)->JSONObject)? = null) {
     private val checkpoint = AtomicFile(File(VideoStore(context).folder(id), "gemini-economy-job.json"))
     suspend fun translate(key: String, batch: VideoTranslationPlan.Batch, profile: String, glossary: String,
+                          stagedBudget: Boolean = false,
                           beforeDispatch: suspend () -> Unit): VideoTranslationClient.Result = withContext(Dispatchers.IO) {
         val payload=VideoTranslationClient.buildRequest(batch,profile,glossary)
         val fingerprint=MessageDigest.getInstance("SHA-256").digest((StandaloneTranslator.FAST_MODEL+payload).toByteArray()).joinToString(""){"%02x".format(it)}
@@ -38,6 +39,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
             // Persist the submission intent first. A lost POST response must not spend quota again.
             saved=JSONObject().put("fingerprint",fingerprint).put("state","SUBMITTING")
                 .put("keyFingerprint", keyFingerprint(selected.key)).put("keySlot", selected.slot)
+            if (stagedBudget) saved.put("stagedBudget", true)
             val result=exchange(selected.key,"models/${StandaloneTranslator.FAST_MODEL}:batchGenerateContent",createRequest(payload,fingerprint),beforeDispatch,saved)
             val name=result.getString("name").also{require(validName(it))}
             saved.put("name",name).put("state","PENDING");write(saved)
@@ -53,6 +55,9 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
         parsed
     }
     fun acknowledge() { checkpoint.delete() }
+    fun hasSavedJob(): Boolean = checkpoint.baseFile.exists()
+    fun usesLegacyRequest(): Boolean = hasSavedJob() &&
+        !JSONObject(checkpoint.openRead().bufferedReader().use { it.readText() }).optBoolean("stagedBudget")
     fun reconcile(project:VideoProject) {
         if(!checkpoint.baseFile.exists())return
         val saved=JSONObject(checkpoint.openRead().bufferedReader().use{it.readText()})
@@ -96,6 +101,7 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
             else available[Math.floorMod(id.hashCode(), available.size)]
     }
     private suspend fun exchange(key:String,path:String,body:JSONObject?,gate:suspend()->Unit,submission:JSONObject?=null):JSONObject {
+        if (VideoApiRecovery.inAdaptiveBatch()) return batchExchange(key, path, body, gate, submission)
         gate();StandaloneTranslator.beforeNetworkCallForTest?.invoke()
         transportForTest?.let { transport ->
             if(submission!=null)write(submission)
@@ -112,6 +118,37 @@ internal class VideoEconomyBatch(private val context: Context, private val id: S
         }
         return JSONObject(result.body)
     }
+
+    private suspend fun batchExchange(key: String, path: String, body: JSONObject?, gate: suspend () -> Unit,
+                                      submission: JSONObject?): JSONObject {
+        var submitted = false
+        try {
+            return VideoGeminiAccounts.withBatchQuota(context, gate) {
+                val request = Request.Builder().url("https://generativelanguage.googleapis.com/v1beta/$path")
+                    .header("x-goog-api-key", key).apply {
+                        if (body != null) post(singleAttemptBody(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType())))
+                    }.build()
+                StandaloneTranslator.beforeNetworkCallForTest?.invoke()
+                if (submission != null) {
+                    write(submission)
+                    submitted = true
+                }
+                transportForTest?.invoke(path, body) ?: JSONObject(VideoApiRecovery.exchange(
+                    StandaloneTranslator.httpClientForRequest(true, true), request, batchQuota = true))
+            }
+        } catch (failure: VideoApiException) {
+            if (!submitted) throw failure
+            val status = failure.httpStatus
+            if (status != null && status in 400..499 && status != 408) {
+                checkpoint.delete()
+                throw failure
+            }
+            throw VideoApiException("ECONOMY_SUBMISSION_UNCERTAIN",
+                detail = "Chưa xác nhận được tác vụ Gemini nền. Kiểm tra tác vụ trong Google AI Studio trước khi gửi tiếp.",
+                failedAtMs = failure.failedAtMs, httpStatus = status)
+        }
+    }
+
     private fun write(value:JSONObject) {
         val out=checkpoint.startWrite()
         try {out.write(value.toString().toByteArray());checkpoint.finishWrite(out)}catch(e:Throwable){checkpoint.failWrite(out);throw e}

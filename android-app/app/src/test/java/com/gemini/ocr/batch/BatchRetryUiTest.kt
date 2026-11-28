@@ -1,6 +1,7 @@
 package com.gemini.ocr.batch
 
 import com.gemini.ocr.video.BatchPipelineStage
+import com.gemini.ocr.video.VideoApiFailureCheckpoint
 import com.gemini.ocr.video.VideoCue
 import com.gemini.ocr.video.VideoPipelineCheckpoint
 import com.gemini.ocr.video.VideoProject
@@ -67,5 +68,29 @@ class BatchRetryUiTest {
         assertTrue(permission.action.contains("quyền truy cập tệp"))
         val unknown = batchRetryGuidance(item.copy(error = "UNRECOGNIZED_PROVIDER_DETAIL"), null)
         assertTrue(unknown.code.isBlank())
+    }
+
+    @Test fun guidanceDistinguishesStoredProviderFailureNewHttpAndSharedPreflight() {
+        val legacy = item.copy(errorCode = "API_RATE_LIMIT")
+        val legacyGuidance = batchRetryGuidance(legacy, project())
+        assertTrue(legacyGuidance.title.contains("Chưa xác định"))
+        assertTrue(batchRetryFailureOrigin(legacyGuidance, null)!!.startsWith("Lỗi đã lưu"))
+
+        val failure = VideoApiFailureCheckpoint("API_RATE_LIMIT", 1_000_000, 429, "SHORT_WINDOW", false)
+        val original = project()
+        fun withFailure(detail: VideoApiFailureCheckpoint) = original.copy(pipeline = original.pipeline.copy(
+            stages = mapOf(stage to original.pipeline.task(stage).copy(lastApiFailure = detail))))
+        val current = batchRetryGuidance(legacy, withFailure(failure))
+        assertTrue(batchRetryFailureOrigin(current, 900_000)!!.startsWith("Lần gửi vừa thất bại (HTTP 429)"))
+        assertTrue(batchRetryFailureOrigin(current, 1_100_000)!!.startsWith("Lỗi đã lưu từ lần gửi gần nhất (HTTP 429)"))
+        val shared = batchRetryGuidance(legacy, withFailure(failure.copy(fromSavedFailure = true)))
+        assertTrue(batchRetryFailureOrigin(shared, 900_000)!!.startsWith("Tập này chưa gửi yêu cầu mới"))
+
+        val zero = batchRetryGuidance(item.copy(errorCode = "API_QUOTA_EXHAUSTED"),
+            withFailure(failure.copy(code = "API_QUOTA_EXHAUSTED", quotaKind = "ZERO")))
+        assertTrue(zero.title.contains("bằng 0"))
+        val daily = batchRetryGuidance(item.copy(errorCode = "API_QUOTA_EXHAUSTED"),
+            withFailure(failure.copy(code = "API_QUOTA_EXHAUSTED", quotaKind = "DAILY")))
+        assertTrue(daily.title.contains("hạn mức ngày"))
     }
 }
