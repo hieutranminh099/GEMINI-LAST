@@ -93,4 +93,22 @@ class VideoBoundedDialoguePlanTest {
             VideoFullDialoguePlan.next(original, 100_000, maxTargets = -1)
         }
     }
+
+    @Test fun stagedDialogueFitsTheEncodedTokenBudgetAndIncludesAdjacentCompletedContext() {
+        val original = cues(48) { "中".repeat(520) + "𠮷$it" }.mapIndexed { index, cue ->
+            if (index == 0) cue.copy(translation = "Câu đã dịch", refinementState = "done") else cue
+        }
+        fun payload(batch: VideoTranslationPlan.Batch) = VideoTranslationClient.buildRequest(batch, "modern", "")
+        val plan = VideoFullDialoguePlan.nextStaged(original, 48_000, "Hồ sơ thử", 16) {
+            VideoBatchRequestBudget.fits(it, payload(it))
+        }!!
+        assertTrue(plan.cueIds.size in 1..8)
+        assertEquals(original.drop(1).take(plan.cueIds.size).map { it.id }, plan.cueIds)
+        val dialogue = JSONObject(plan.videoContext).getJSONArray("dialogue")
+        assertTrue(dialogue.length() <= plan.cueIds.size + VideoBatchRequestBudget.MAX_DIALOGUE_NEIGHBORS)
+        assertEquals(original.first().id, dialogue.getJSONObject(0).getString("id"))
+        assertEquals(original.first().translation, dialogue.getJSONObject(0).getString("vietnamese"))
+        assertTrue(VideoBatchRequestBudget.estimateInputTokens(payload(plan)) <= VideoBatchRequestBudget.MAX_INPUT_TOKENS)
+        assertTrue(plan.maxOutputTokens in VideoBatchRequestBudget.MIN_OUTPUT_TOKENS until VideoBatchRequestBudget.MAX_OUTPUT_TOKENS)
+    }
 }

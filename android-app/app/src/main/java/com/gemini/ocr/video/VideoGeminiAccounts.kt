@@ -11,12 +11,80 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.security.MessageDigest
 
 /** Credential selection for stateless video requests. Economy jobs retain their submission owner. */
 internal object VideoGeminiAccounts {
     private val pools = mutableMapOf<String, GeminiAccountPool>()
+    private val batchQuotas = mutableMapOf<String, VideoBatchGeminiQuota>()
+    private val directBatchQuota = VideoBatchGeminiQuota(awaitReducedTurn = reducedBatchDispatch())
+    @Volatile internal var overrideBatchQuotaForTest: VideoBatchGeminiQuota? = null
+
+    suspend fun <T> requestBatch(
+        context: Context?,
+        primaryKey: String,
+        affinity: String,
+        beforeDispatch: suspend () -> Unit,
+        operation: suspend (GeminiKeySlot) -> T
+    ): T {
+        val settings = context?.let(::AppSettings)
+        val mode = settings?.geminiKeyMode ?: GeminiKeyMode.PRIMARY_ONLY
+        val credentials = if (mode == GeminiKeyMode.PRIMARY_ONLY) listOf(GeminiKeySlot(1, primaryKey.trim()))
+            else requireNotNull(settings).geminiVideoKeys()
+        val selected = if (mode == GeminiKeyMode.BALANCED && credentials.isNotEmpty()) {
+            credentials[Math.floorMod(affinity.hashCode(), credentials.size)]
+        } else credentials.firstOrNull()
+        val slot = selected?.takeIf { it.key.isNotBlank() }
+            ?: throw VideoApiException("API_AUTH", detail = "Chưa có khóa Gemini cho video. Kiểm tra khóa và quyền API.")
+        return withBatchQuota(context, beforeDispatch) { operation(slot) }
+    }
+
+    /** Economy keeps the key already bound to its durable job; it shares quota admission. */
+    suspend fun <T> withBatchQuota(context: Context?, beforeDispatch: suspend () -> Unit,
+                                   operation: suspend () -> T): T {
+        val quota = overrideBatchQuotaForTest?.also { check(com.gemini.ocr.BuildConfig.DEBUG) }
+            ?: if (context == null) directBatchQuota else batchQuota(context)
+        return quota.request(beforeDispatch, operation)
+    }
+
+    private fun batchQuota(context: Context): VideoBatchGeminiQuota = synchronized(batchQuotas) {
+        val app = context.applicationContext
+        batchQuotas.getOrPut(app.filesDir.absolutePath) {
+            val preferences = app.getSharedPreferences("gemini-video-batch-quota", Context.MODE_PRIVATE)
+            VideoBatchGeminiQuota(
+                awaitReducedTurn = reducedBatchDispatch(),
+                load = {
+                    val deadline = preferences.getLong("deadline", 0)
+                    val code = preferences.getString("code", "").orEmpty()
+                    val at = preferences.getLong("failedAt", 0)
+                    val status = preferences.getInt("httpStatus", 0).takeIf { it > 0 }
+                    val kind = VideoQuotaKind.entries.firstOrNull { it.name == preferences.getString("quotaKind", "") }
+                    val wait = preferences.getLong("retryAfter", 0)
+                    if (deadline <= 0 || code.isBlank()) null else when (status) {
+                        429 -> VideoApiRecovery.quotaFailure(kind ?: VideoQuotaKind.UNKNOWN, wait, at,
+                            preferences.getBoolean("inputTokenLimited", false))
+                        null -> VideoApiRecovery.networkFailure(code)
+                        else -> VideoApiRecovery.httpFailure(status, nowMs = at)
+                    }.withRecovery(deadline, at, saved = true)
+                },
+                save = { failure ->
+                    preferences.edit().putLong("deadline", failure.nextRetryAt).putString("code", failure.code)
+                        .putLong("failedAt", failure.failedAtMs).putInt("httpStatus", failure.httpStatus ?: 0)
+                        .putString("quotaKind", failure.quotaKind?.name.orEmpty())
+                        .putBoolean("inputTokenLimited", failure.inputTokenLimited)
+                        .putLong("retryAfter", failure.retryAfterMs).commit()
+                }
+            )
+        }
+    }
+
+    private fun reducedBatchDispatch(): suspend () -> Unit {
+        val limiter = GeminiDispatchLimiter(maximum = 1, windowMs = 8_000L)
+        return { limiter.awaitTurn() }
+    }
 
     suspend fun <T> request(
         context: Context,
@@ -55,6 +123,55 @@ internal object VideoGeminiAccounts {
             )
         }
     }
+}
+
+/** The settings contain no Google project IDs. All video keys share one conservative quota. */
+internal class VideoBatchGeminiQuota(
+    private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val awaitTurn: suspend () -> Unit = { StandaloneTranslator.awaitVideoDispatchTurn() },
+    load: () -> VideoApiException? = { null },
+    private val save: (VideoApiException) -> Unit = {},
+    private val awaitReducedTurn: suspend () -> Unit = {}
+) {
+    private val lane = Mutex()
+    private var cooldown = load()
+    private var limitedDispatches = if (cooldown?.let {
+        it.code == "API_RATE_LIMIT" && it.nextRetryAt >= clockMs() - 60_000L
+    } == true) 4 else 0
+
+    suspend fun <T> request(beforeDispatch: suspend () -> Unit, operation: suspend () -> T): T =
+        VideoApiRecovery.withAccountAdmission {
+            lane.withLock {
+                VideoApiRecovery.terminalProjectFailure()?.let { throw it.withRecovery(saved = true) }
+                cooldown?.takeIf { it.nextRetryAt > clockMs() }?.let { throw it.withRecovery(saved = true) }
+                if (limitedDispatches > 0) awaitReducedTurn()
+                awaitTurn()
+                currentCoroutineContext().ensureActive()
+                beforeDispatch()
+                currentCoroutineContext().ensureActive()
+                try {
+                    operation().also { if (limitedDispatches > 0) limitedDispatches-- }
+                } catch (error: IOException) {
+                    val failure = if (error is VideoApiException) error else VideoApiRecovery.networkFailure(error)
+                    val failedAt = failure.failedAtMs.takeIf { it > 0 } ?: clockMs()
+                    if (failure.transient) {
+                        val wait = failure.retryAfterMs.takeIf { it > 0 } ?: 60_000L
+                        val deadline = maxOf(failure.nextRetryAt, failedAt + wait.coerceAtMost(Long.MAX_VALUE - failedAt))
+                        val waiting = failure.withRecovery(deadline, failedAt)
+                        if (failure.code == "API_RATE_LIMIT") limitedDispatches = 4
+                        cooldown = waiting
+                        // The caller also checkpoints this failure. Keep the in-memory quota if the
+                        // shared store is temporarily unavailable, and report the provider failure.
+                        runCatching { save(waiting) }
+                        throw waiting
+                    }
+                    if (failure.code == "API_AUTH" || failure.code == "API_QUOTA_EXHAUSTED") {
+                        VideoApiRecovery.stopBatchProject(failure)
+                    }
+                    throw failure
+                }
+            }
+        }
 }
 
 internal data class GeminiAccountCooldown(val untilMs: Long, val code: String)

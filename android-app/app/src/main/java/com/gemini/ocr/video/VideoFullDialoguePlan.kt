@@ -17,7 +17,15 @@ internal object VideoFullDialoguePlan {
 
     /** Bound targets before encoding candidate requests; context still contains every row that fits. */
     fun next(cues:List<VideoCue>,durationMs:Long,filmContext:String="",maxTargets:Int,
-        fitsRequest:((VideoTranslationPlan.Batch)->Boolean)?=null):VideoTranslationPlan.Batch? {
+        fitsRequest:((VideoTranslationPlan.Batch)->Boolean)?=null):VideoTranslationPlan.Batch? =
+        next(cues,durationMs,filmContext,maxTargets,staged=false,fitsRequest=fitsRequest)
+
+    fun nextStaged(cues: List<VideoCue>, durationMs: Long, filmContext: String, maxTargets: Int,
+                   fitsRequest: (VideoTranslationPlan.Batch) -> Boolean): VideoTranslationPlan.Batch? =
+        next(cues, durationMs, filmContext, maxTargets, staged = true, fitsRequest = fitsRequest)
+
+    private fun next(cues:List<VideoCue>,durationMs:Long,filmContext:String,maxTargets:Int,staged:Boolean,
+                     fitsRequest:((VideoTranslationPlan.Batch)->Boolean)?):VideoTranslationPlan.Batch? {
         require(maxTargets>0){"Giới hạn số câu mỗi nhóm phải lớn hơn 0."}
         val chronological=VideoTimeline.validate(cues,durationMs)
         val originalById=cues.indices.associateBy{cues[it].id}
@@ -28,6 +36,8 @@ internal object VideoFullDialoguePlan {
         val windowBase=encoded.context(emptyList(),emptyList(),false).utf8Size().toLong()
         val fullBase=encoded.context(emptyList(),emptyList(),true).utf8Size().toLong()
         val selected=mutableListOf<Int>()
+        val minimumOutput = if (staged) VideoBatchRequestBudget.MIN_OUTPUT_TOKENS else 8192
+        val outputLimit = if (staged) VideoBatchRequestBudget.MAX_OUTPUT_TOKENS else MAX_OUTPUT_TOKENS
         var output=OUTPUT_OVERHEAD
         var mandatoryBytes=windowBase
         for(index in pending){
@@ -37,7 +47,7 @@ internal object VideoFullDialoguePlan {
             val nextBytes=mandatoryBytes+rowCost+idCost+(if(selected.isEmpty())0 else 2)
             val nextOutput=output+outputCost(cues[index])
             val finalScopeAdjustment=if(selected.size+1==cues.size)fullBase-windowBase else 0L
-            if(nextBytes+finalScopeAdjustment>MAX_CONTEXT_BYTES || nextOutput>MAX_OUTPUT_TOKENS)break
+            if(nextBytes+finalScopeAdjustment>MAX_CONTEXT_BYTES || nextOutput>outputLimit)break
             selected+=index;mandatoryBytes=nextBytes;output=nextOutput
         }
         require(selected.isNotEmpty()){"Một câu nguồn hoặc ngữ cảnh phim vượt giới hạn gửi Gemini. Nguồn đã lưu; kiểm tra câu đó trước khi tiếp tục. Không tự cắt hoặc bỏ câu."}
@@ -47,7 +57,7 @@ internal object VideoFullDialoguePlan {
             val rows=indices.map{cues[it]}
             return VideoTranslationPlan.Batch(indices,rows.map{it.id},rows.map{it.source},
                 rows.map{it.localDraft.ifBlank{it.translation}},encoded.context(contextRows,indices,complete || contextRows.toSet().size==cues.size),
-                (OUTPUT_OVERHEAD+targets.sumOf{outputCost(cues[it])}).toInt().coerceIn(8192,MAX_OUTPUT_TOKENS),fullDialogue=true)
+                (OUTPUT_OVERHEAD+targets.sumOf{outputCost(cues[it])}).toInt().coerceIn(minimumOutput,outputLimit),fullDialogue=true)
         }
         fun fits(batch:VideoTranslationPlan.Batch)=fitsRequest?.invoke(batch)?:true
         var targets=selected.toList()
@@ -61,27 +71,31 @@ internal object VideoFullDialoguePlan {
                 if(fits(make(selected.take(middle),selected.take(middle),false))){best=middle;low=middle+1}
                 else high=middle-1
             }
+            if (staged && best == 0) throw VideoBatchRequestBudget.exceeded()
             require(best>0){"Một câu nguồn cùng cấu hình/ngữ cảnh vượt dung lượng yêu cầu Gemini. Nguồn đã lưu; chưa gửi dữ liệu."}
             targets=selected.take(best);mandatory=make(targets,targets,false)
         }
 
-        // Optional context never makes a target part smaller. Prefer all dialogue if it
-        // fits; otherwise keep every target and fill spare space with nearby whole rows.
-        val idBytes=targets.sumOf{JSONObject.quote(cues[it].id).utf8Size().toLong()}+(targets.size-1).coerceAtLeast(0)
-        var fullBytes=fullBase+idBytes
-        for((position,index) in ordered.withIndex()){
-            fullBytes+=encoded.row(index).utf8Size()+(if(position==0)0 else 1)
-            if(fullBytes>MAX_CONTEXT_BYTES)break
-        }
-        if(fullBytes<=MAX_CONTEXT_BYTES){
-            val full=make(targets,ordered,true)
-            if(fits(full))return full
+        // The staged worker sends a small window. The single-video and pending economy
+        // paths retain their established request shape so older saved jobs remain resumable.
+        if (!staged) {
+            val idBytes=targets.sumOf{JSONObject.quote(cues[it].id).utf8Size().toLong()}+(targets.size-1).coerceAtLeast(0)
+            var fullBytes=fullBase+idBytes
+            for((position,index) in ordered.withIndex()){
+                fullBytes+=encoded.row(index).utf8Size()+(if(position==0)0 else 1)
+                if(fullBytes>MAX_CONTEXT_BYTES)break
+            }
+            if(fullBytes<=MAX_CONTEXT_BYTES){
+                val full=make(targets,ordered,true)
+                if(fits(full))return full
+            }
         }
         val targetSet=targets.toSet()
         var used=windowBase+targets.sumOf{encoded.row(it).utf8Size().toLong()+JSONObject.quote(cues[it].id).utf8Size()}+
             2L*(targets.size-1).coerceAtLeast(0)
         val optional=mutableListOf<Int>()
-        for(index in nearby(ordered,targetSet)){
+        val neighbors = nearby(ordered,targetSet)
+        for(index in if (staged) neighbors.take(VideoBatchRequestBudget.MAX_DIALOGUE_NEIGHBORS) else neighbors){
             val extra=encoded.row(index).utf8Size().toLong()+1
             if(used+extra<=MAX_CONTEXT_BYTES){optional+=index;used+=extra}
         }

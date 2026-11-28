@@ -56,13 +56,16 @@ object VideoTranslationPlan {
     /** Earlier targets are resolved or deferred in this pass, but remain available as context. */
     internal fun nextProjectedCloudBatch(
         cues: List<VideoCue>, hybrid: Boolean, maxCues: Int, startIndex: Int,
+        fitsRequest: ((Batch) -> Boolean)? = null,
         projectCue: (Int, VideoCue) -> VideoCue
     ): Batch? {
         val projected = object : AbstractList<VideoCue>() {
             override val size = cues.size
             override fun get(index: Int) = projectCue(index, cues[index])
         }
-        return nextCloudBatch(projected, hybrid, maxCues, SOURCE_BUDGET, startIndex)
+        val batch = nextCloudBatch(projected, hybrid, maxCues, SOURCE_BUDGET, startIndex) ?: return null
+        return if (fitsRequest == null) batch else VideoBatchRequestBudget.fit(batch,
+            { count -> buildBatch(projected, hybrid, batch.indices.take(count)) }, fitsRequest)
     }
 
     private fun nextCloudBatch(cues:List<VideoCue>,hybrid:Boolean,maxCues:Int,maxSourceChars:Int,startIndex:Int):Batch?{

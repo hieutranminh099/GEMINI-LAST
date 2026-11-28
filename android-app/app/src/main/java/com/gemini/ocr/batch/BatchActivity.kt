@@ -249,6 +249,7 @@ fun BatchScreen(initialBatchId: String = "", addOnOpen: Boolean = false, onBack:
     val canReview = batch?.let { BatchWorkflowUi.reviewAvailable(it, videos) } == true
     val progress = batch?.let { BatchWorkflowUi.progress(it, videos) } ?: 0f
     val running = batch != null && busy == batch.id
+    val observedRunSince = remember(batch?.id, running) { if (running) System.currentTimeMillis() else null }
     val retryProjects = videos.filter { it.id == videoBusy || it.id in parallelProjects }
     val retryWaiting = running && batch?.let { BatchWorkflowUi.retryWaiting(it, retryProjects) } == true
     val mergedOutput = batch?.takeIf { it.mergeEpisodes && it.state == "REVIEW" }?.outputs?.singleOrNull()
@@ -682,7 +683,7 @@ fun BatchScreen(initialBatchId: String = "", addOnOpen: Boolean = false, onBack:
                                 val project = videos.firstOrNull { it.id == item.projectId }
                                 BatchVideoCard(item, index, batch.items.size, project, false, false,
                                     { openVideo(item.projectId, "review") }, openEnabled = busy == null && videoBusy == null && !working,
-                                    episodeOutputs = { EpisodeOutputs(batch.id, item, project) })
+                                    episodeOutputs = { EpisodeOutputs(batch.id, item, project) }, batch = batch, observedRunSince = observedRunSince)
                             }
                         }
                         3 -> {
@@ -710,7 +711,7 @@ fun BatchScreen(initialBatchId: String = "", addOnOpen: Boolean = false, onBack:
                                 val project = videos.firstOrNull { it.id == item.projectId }
                                 BatchVideoCard(item, index, batch.items.size, project, false, false,
                                     { openVideo(item.projectId, "review") }, openEnabled = busy == null && videoBusy == null && !working,
-                                    episodeOutputs = { EpisodeOutputs(batch.id, item, project) })
+                                    episodeOutputs = { EpisodeOutputs(batch.id, item, project) }, batch = batch, observedRunSince = observedRunSince)
                             }
                             item { ExpandableSection("Đối chiếu các phiên bản phụ đề", "Giữ OCR gốc, chữ Trung đã kiểm tra, bản dịch nháp và sau hiệu đính.") {
                                 batch.items.forEach { item ->
@@ -987,7 +988,7 @@ private fun <T> BatchChoice(title: String, value: String, enabled: Boolean, opti
 private fun BatchVideoCard(item: BatchItem, index: Int, total: Int, project: VideoProject?, editable: Boolean,
     showOrdering: Boolean, onOpen: () -> Unit, openEnabled: Boolean = true,
     onRemove: () -> Unit = {}, onMove: (Int) -> Unit = {}, onEpisode: (String) -> Unit = {},
-    episodeOutputs: (@Composable () -> Unit)? = null) {
+    episodeOutputs: (@Composable () -> Unit)? = null, batch: BatchProject? = null, observedRunSince: Long? = null) {
     var episode by rememberSaveable(item.projectId, item.episode) { mutableStateOf(item.episode) }
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = OceanColors.Card)) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1004,7 +1005,7 @@ private fun BatchVideoCard(item: BatchItem, index: Int, total: Int, project: Vid
                         val stagePercent = if (item.state == "EXPORTING") project.progress.coerceIn(0, 100)
                             else VideoStageProgress.percent(project, item.stage)
                         Text("$stageLabel · ${project.cues.size} câu · $stagePercent%", style = MaterialTheme.typography.bodySmall)
-                        if (item.stage == com.gemini.ocr.video.BatchPipelineStage.TRANSLATE) {
+                        if (project.cues.isNotEmpty()) {
                             Text("Đã dịch hợp lệ: ${VideoStageProgress.translatedCueCount(project)}/${project.cues.size} câu",
                                 style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("batch_valid_translation_count"))
                         }
@@ -1017,7 +1018,7 @@ private fun BatchVideoCard(item: BatchItem, index: Int, total: Int, project: Vid
             }
             if (project != null && !showOrdering) VideoAsrOverlapReviewButton(project)
             if (project != null && !showOrdering) videoUnclearSpeechNotice(project)?.let { StatusNotice(it) }
-            BatchRetryErrorNotice(item, project)
+            BatchRetryErrorNotice(item, project, batch, observedRunSince)
             if (showOrdering) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Tập ${item.episode.takeUnless { it.startsWith("video-") } ?: (index + 1)}", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)

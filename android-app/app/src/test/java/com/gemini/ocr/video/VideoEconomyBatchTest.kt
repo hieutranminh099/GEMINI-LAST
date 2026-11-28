@@ -79,6 +79,44 @@ class VideoEconomyBatchTest {
         assertEquals(1,posts)
     }
 
+    @Test fun stagedEconomyRetriesDefinitive429AndNeverReplaysAnUncertain503(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val id = UUID.randomUUID().toString()
+        val batch = VideoTranslationPlan.nextCloudBatch(listOf(VideoCue("one", 0, 500, "你好")), false)!!
+        val checkpoint = File(VideoStore(context).folder(id), "gemini-economy-job.json")
+        var now = 1_000L
+        var posts = 0
+        val economy = VideoEconomyBatch(context, id) { _, body ->
+            checkNotNull(body)
+            posts++
+            throw VideoApiRecovery.httpFailure(if (posts == 1) 429 else 503, retryAfter = "7", nowMs = now)
+        }
+        VideoGeminiAccounts.overrideBatchQuotaForTest = VideoBatchGeminiQuota(clockMs = { now }, awaitTurn = {})
+        try {
+            VideoApiRecovery.withAdaptiveBatch(1) {
+                suspend fun request() = runCatching { economy.translate("fixture", batch, "manga", "") {} }
+                    .exceptionOrNull()
+                val limited = request() as VideoApiException
+                assertEquals("API_RATE_LIMIT", limited.code)
+                assertEquals(8_000L, limited.nextRetryAt)
+                assertFalse(checkpoint.exists())
+                assertTrue((request() as VideoApiException).fromSavedFailure)
+                assertEquals(1, posts)
+                now = 8_000L
+                val uncertain = request() as VideoApiException
+                assertEquals("ECONOMY_SUBMISSION_UNCERTAIN", uncertain.code)
+                assertEquals(503, uncertain.httpStatus)
+                assertFalse(uncertain.transient)
+                assertTrue(checkpoint.exists())
+                now = 15_000L
+                assertTrue(request() is IllegalArgumentException)
+                assertEquals(2, posts)
+            }
+        } finally {
+            VideoGeminiAccounts.overrideBatchQuotaForTest = null
+        }
+    }
+
     @Test fun configuredEconomyJobKeepsItsChosenKeyAcrossModeChangesWithoutPersistingSecrets(): Unit = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val id = UUID.randomUUID().toString()

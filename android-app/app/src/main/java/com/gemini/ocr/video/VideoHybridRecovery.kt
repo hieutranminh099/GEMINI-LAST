@@ -12,7 +12,7 @@ internal class VideoHybridRecovery(savedTargetLimit: Int = 0, previousStageError
     }
 
     var targetLimit: Int = savedTargetLimit.takeIf { it in 1..MAX_TARGETS }
-        ?.coerceAtLeast(MIN_TARGETS) ?: INITIAL_TARGETS
+        ?.coerceAtLeast(if (previousStageError == "API_RATE_LIMIT") 1 else MIN_TARGETS) ?: INITIAL_TARGETS
         private set
     var invalidReplies: Int = 0
         private set

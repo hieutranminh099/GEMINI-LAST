@@ -21,6 +21,21 @@ import java.util.UUID
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class VideoPartialResponseRecoveryTest {
+    private fun assertAdjacentDialogue(request: VideoTranslationPlan.Batch) {
+        val context = JSONObject(request.videoContext)
+        val dialogue = context.getJSONArray("dialogue")
+        val indices = List(dialogue.length()) { dialogue.getJSONObject(it).getInt("index") }
+        val targetIds = context.getJSONArray("targetIds")
+        assertEquals(request.cueIds, List(targetIds.length()) { targetIds.getString(it) })
+        assertTrue(indices.containsAll(request.indices))
+        assertFalse(context.getBoolean("contextComplete"))
+        val neighbors = indices.filterNot { it in request.indices }
+        assertTrue(neighbors.size in 1..VideoBatchRequestBudget.MAX_DIALOGUE_NEIGHBORS)
+        assertTrue(neighbors.all { neighbor -> request.indices.any {
+            kotlin.math.abs(neighbor - it) <= VideoBatchRequestBudget.MAX_DIALOGUE_NEIGHBORS
+        } })
+    }
+
     private val context: Context get() = ApplicationProvider.getApplicationContext()
     private val store: VideoStore get() = VideoStore(context)
 
@@ -80,7 +95,7 @@ class VideoPartialResponseRecoveryTest {
         val accepted = mutableSetOf<String>()
         VideoTranslationClient.overrideResponseForTest = { request ->
             sent += request.cueIds
-            assertEquals(740, JSONObject(request.videoContext).getJSONArray("dialogue").length())
+            assertAdjacentDialogue(request)
             assertFalse(request.cueIds.contains(original.cues.first().id))
             assertTrue(request.cueIds.none { it in accepted })
             if (sent.size > 1) {
@@ -113,7 +128,7 @@ class VideoPartialResponseRecoveryTest {
         assertEquals(0, batches.load(batch.id).autoRetryAttempts)
     }
 
-    @Test fun oldIncompleteCheckpointResumesWithSmallTargetsAndKeepsTheFullDialogue() = runBlocking {
+    @Test fun oldIncompleteCheckpointResumesWithSmallTargetsAndKeepsAdjacentDialogue() = runBlocking {
         val original = project(389)
         val finished = original.cues.mapIndexed { i, cue ->
             if (i in 1..182) cue.copy(translation = "Bản Việt ${cue.id}", draftVi = "Bản Việt ${cue.id}",
@@ -125,7 +140,7 @@ class VideoPartialResponseRecoveryTest {
         val sent = mutableListOf<String>()
         VideoTranslationClient.overrideResponseForTest = { request ->
             assertTrue(request.cueIds.size <= 64)
-            assertEquals(389, JSONObject(request.videoContext).getJSONArray("dialogue").length())
+            assertAdjacentDialogue(request)
             assertTrue(request.cueIds.none { id -> finished.first { it.id == id }.refinementState == "done" })
             sent += request.cueIds
             body(request.cueIds)
@@ -199,7 +214,7 @@ class VideoPartialResponseRecoveryTest {
         val accepted = mutableSetOf<String>()
         VideoTranslationClient.overrideResponseForTest = { request ->
             sizes += request.cueIds.size
-            assertEquals(260, JSONObject(request.videoContext).getJSONArray("dialogue").length())
+            assertAdjacentDialogue(request)
             assertTrue(request.cueIds.none { it in accepted || it == original.cues.first().id })
             if (sizes.size > 1) {
                 val checkpoint = store.load(original.id)
@@ -242,7 +257,7 @@ class VideoPartialResponseRecoveryTest {
         val accepted = mutableSetOf<String>()
         VideoTranslationClient.overrideResponseForTest = { request ->
             sizes += request.cueIds.size
-            assertEquals(100, JSONObject(request.videoContext).getJSONArray("dialogue").length())
+            assertAdjacentDialogue(request)
             assertTrue(request.cueIds.none { it in accepted || it == original.cues.first().id })
             if (sizes.size == 1) body(listOf("unknown-id")) else {
                 accepted += request.cueIds
